@@ -1,0 +1,36 @@
+# Android Studio / IntelliJ
+*.iml
+.idea/
+
+# Gradle
+.gradle/
+build/
+**/build/
+
+# Local SDK/NDK path
+local.properties
+
+# Native build outputs
+.externalNativeBuild/
+.cxx/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Android generated
+captures/
+
+# Logs and temp
+*.log
+*.tmp
+*.bak
+
+# Signing keys / secrets
+*.jks
+*.keystore
+keystore.properties
+
+# APK/AAB outputs (use GitHub Releases instead)
+*.apk
+*.aab

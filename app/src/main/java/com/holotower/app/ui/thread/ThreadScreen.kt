@@ -67,12 +67,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -81,6 +83,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.MediaItem
@@ -91,19 +96,26 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import coil3.compose.AsyncImage
 import com.holotower.app.R
+import com.holotower.app.data.local.ThreadPositionStore
 import com.holotower.app.data.model.Post
 import com.holotower.app.data.network.CloudflareHelper
+import com.holotower.app.data.network.ForegroundChallengePolicy
 import com.holotower.app.data.network.RetrofitClient
 import com.holotower.app.data.repository.BoardRepository
 import com.holotower.app.ui.common.PostCard
 import com.holotower.app.viewmodel.ThreadUiState
 import com.holotower.app.viewmodel.ThreadViewModel
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 private val BackgroundColor = Color(0xFF111111)
 private val TextPrimary = Color(0xFFEAEAEA)
@@ -129,11 +141,11 @@ private const val COMPOSER_CLOSE_THRESHOLD = 90f
 private const val CUE_SHOW_THRESHOLD = 28f
 private const val QUICK_SWIPE_MIN_DISTANCE = 26f
 private const val QUICK_SWIPE_MAX_DURATION_MS = 160L
+private const val JUMP_TO_LATEST_DISTANCE_THRESHOLD = 12
+private const val JUMP_TO_LATEST_VISIBLE_MS = 5_000L
 
 private enum class MediaKind { Image, Video }
 private enum class SwipeAxis { Undecided, Horizontal, Vertical }
-private data class ThreadScrollPosition(val index: Int, val offset: Int)
-private val threadScrollMemory = mutableMapOf<Long, ThreadScrollPosition>()
 
 private data class GalleryMediaItem(
     val postNo: Long,
@@ -509,7 +521,7 @@ private fun HorizontalSwipeLayer(
 
     Box(
         modifier = modifier
-            .graphicsLayer { translationX = overlayTranslationX(swipeX.floatValue) }
+            .offset { IntOffset(overlayTranslationX(swipeX.floatValue).roundToInt(), 0) }
             .pointerInput(enabled, threshold, allowPositive, allowNegative, cueDistance) {
                 if (!enabled) return@pointerInput
                 detectHorizontalDragGestures(
@@ -602,11 +614,12 @@ private fun VerticalProgressBar(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, FlowPreview::class)
 @Composable
 fun ThreadScreen(
     board: String,
     threadNo: Long,
+    refreshAfterCloudflareToken: Long = 0L,
     onBack: () -> Unit,
     onOpenThread: (Long) -> Unit = {},
     onRefreshCloudflare: (() -> Unit)? = null,
@@ -616,6 +629,7 @@ fun ThreadScreen(
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val repo = remember { BoardRepository() }
 
     val successPosts = (state as? ThreadUiState.Success)?.posts
@@ -655,23 +669,85 @@ fun ThreadScreen(
             lastVisible >= total - 1
         }
     }
+    val distanceFromLatest by remember(listState, allPosts) {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val total = info.totalItemsCount
+            if (total == 0) return@derivedStateOf 0
+            val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+            (total - 1 - lastVisible).coerceAtLeast(0)
+        }
+    }
     LaunchedEffect(threadNo, allPosts.size, hasRestoredScroll) {
         if (hasRestoredScroll || allPosts.isEmpty()) return@LaunchedEffect
-        val saved = threadScrollMemory[threadNo]
+        val saved = ThreadPositionStore.load(context, board, threadNo)
         if (saved != null) {
-            val safeIndex = saved.index.coerceIn(0, allPosts.lastIndex.coerceAtLeast(0))
-            listState.scrollToItem(safeIndex, saved.offset.coerceAtLeast(0))
+            val restoredIndex = allPosts.indexOfFirst { it.no == saved.postNo }
+                .takeIf { it >= 0 }
+                ?: saved.index.coerceIn(0, allPosts.lastIndex.coerceAtLeast(0))
+            listState.scrollToItem(restoredIndex, saved.offset.coerceAtLeast(0))
         }
         hasRestoredScroll = true
     }
 
-    DisposableEffect(threadNo) {
+    LaunchedEffect(board, threadNo, allPosts) {
+        if (allPosts.isEmpty()) return@LaunchedEffect
+        snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+            .distinctUntilChanged()
+            .debounce(500)
+            .collectLatest { (index, offset) ->
+                val safeIndex = index.coerceIn(0, allPosts.lastIndex.coerceAtLeast(0))
+                val postNo = allPosts.getOrNull(safeIndex)?.no ?: return@collectLatest
+                ThreadPositionStore.save(
+                    context = context,
+                    board = board,
+                    threadNo = threadNo,
+                    postNo = postNo,
+                    index = safeIndex,
+                    offset = offset
+                )
+            }
+    }
+
+    DisposableEffect(board, threadNo, allPosts) {
         onDispose {
-            threadScrollMemory[threadNo] = ThreadScrollPosition(
-                index = listState.firstVisibleItemIndex,
+            if (allPosts.isEmpty()) return@onDispose
+            val safeIndex = listState.firstVisibleItemIndex.coerceIn(0, allPosts.lastIndex.coerceAtLeast(0))
+            val postNo = allPosts.getOrNull(safeIndex)?.no ?: return@onDispose
+            ThreadPositionStore.save(
+                context = context,
+                board = board,
+                threadNo = threadNo,
+                postNo = postNo,
+                index = safeIndex,
                 offset = listState.firstVisibleItemScrollOffset
             )
         }
+    }
+
+    LaunchedEffect(refreshAfterCloudflareToken) {
+        if (refreshAfterCloudflareToken != 0L) {
+            delay(350)
+            vm.load(forceRefresh = true, retryOnFailure = true)
+        }
+    }
+
+    var lastHandledBackgroundToken by remember(threadNo) { mutableStateOf(0L) }
+    DisposableEffect(lifecycleOwner, onRefreshCloudflare, anyOverlayOpen, threadNo) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event != Lifecycle.Event.ON_START || onRefreshCloudflare == null || anyOverlayOpen) {
+                return@LifecycleEventObserver
+            }
+            val backgroundToken = ForegroundChallengePolicy.backgroundToken()
+            val shouldRefresh = backgroundToken != lastHandledBackgroundToken &&
+                ForegroundChallengePolicy.shouldRecheckFor(backgroundToken)
+            if (shouldRefresh) {
+                lastHandledBackgroundToken = backgroundToken
+                onRefreshCloudflare()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     val openExternalLink: (String) -> Unit = { rawUrl ->
@@ -750,6 +826,44 @@ fun ThreadScreen(
                 )
             }
         }
+    }
+
+    val jumpToPostInThread: (Long) -> Unit = { targetPostNo ->
+        val index = allPosts.indexOfFirst { it.no == targetPostNo }
+        if (index >= 0) {
+            scope.launch { listState.animateScrollToItem(index) }
+        } else {
+            Toast.makeText(context, "Post not found in loaded thread", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    val jumpToLatestPost: () -> Unit = {
+        if (allPosts.isNotEmpty()) {
+            scope.launch { listState.animateScrollToItem(allPosts.lastIndex) }
+        }
+    }
+    var showJumpToLatestChip by remember(threadNo) { mutableStateOf(false) }
+    var jumpToLatestChipToken by remember(threadNo) { mutableIntStateOf(0) }
+
+    LaunchedEffect(threadNo, anyOverlayOpen) {
+        snapshotFlow {
+            Triple(listState.isScrollInProgress, distanceFromLatest, isAtBottom)
+        }.collectLatest { (isScrolling, distance, atBottom) ->
+            if (anyOverlayOpen || atBottom || distance < JUMP_TO_LATEST_DISTANCE_THRESHOLD) {
+                showJumpToLatestChip = false
+                return@collectLatest
+            }
+            if (isScrolling) {
+                jumpToLatestChipToken += 1
+                showJumpToLatestChip = true
+            }
+        }
+    }
+
+    LaunchedEffect(jumpToLatestChipToken) {
+        if (jumpToLatestChipToken == 0) return@LaunchedEffect
+        delay(JUMP_TO_LATEST_VISIBLE_MS)
+        showJumpToLatestChip = false
     }
 
     Scaffold(
@@ -902,6 +1016,25 @@ fun ThreadScreen(
                                 fontWeight = FontWeight.SemiBold
                             )
                         }
+                    }
+                }
+
+                if (!anyOverlayOpen && showJumpToLatestChip && allPosts.isNotEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .navigationBarsPadding()
+                            .padding(bottom = 10.dp)
+                            .clickable(onClick = jumpToLatestPost)
+                            .background(Color(0xCC111111), RoundedCornerShape(999.dp))
+                            .padding(horizontal = 12.dp, vertical = 7.dp)
+                    ) {
+                        Text(
+                            text = "Jump to latest",
+                            color = LoadingGreen,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
                 }
 
@@ -1129,8 +1262,8 @@ fun ThreadScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color(0xEE000000))
-                .graphicsLayer {
-                    translationX = overlayTranslationX(swipeX)
+                .offset {
+                    IntOffset(overlayTranslationX(swipeX).roundToInt(), 0)
                 }
                 .pointerInput(Unit) {
                     detectHorizontalDragGestures(
@@ -1171,13 +1304,10 @@ fun ThreadScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(vertical = 6.dp)
-                                    .clickable {
-                                        selectedMediaIndex = index
-                                        showGalleryList = false
-                                    }
                                     .background(Color(0xFF1E1E1E))
                                     .padding(8.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
                                 var thumbIndex by remember(media.postNo) { mutableStateOf(0) }
                                 var thumbExhausted by remember(media.postNo) { mutableStateOf(false) }
@@ -1194,7 +1324,12 @@ fun ThreadScreen(
                                             }
                                         },
                                         alignment = Alignment.TopCenter,
-                                        modifier = Modifier.size(72.dp),
+                                        modifier = Modifier
+                                            .size(72.dp)
+                                            .clickable {
+                                                selectedMediaIndex = index
+                                                showGalleryList = false
+                                            },
                                         contentScale = ContentScale.Crop
                                     )
                                 } else {
@@ -1208,8 +1343,7 @@ fun ThreadScreen(
                                     }
                                 }
 
-                                Spacer(modifier = Modifier.width(10.dp))
-                                Column {
+                                Column(modifier = Modifier.weight(1f)) {
                                     Text("No. ${media.postNo}", color = Color.White, fontWeight = FontWeight.Bold)
                                     Text(media.fileName, color = Color(0xFFD6D6D6), fontSize = 12.sp)
                                     val meta = listOfNotNull(
@@ -1218,6 +1352,24 @@ fun ThreadScreen(
                                     ).joinToString(" | ")
                                     if (meta.isNotBlank()) {
                                         Text(meta, color = Color(0xFF9A9A9A), fontSize = 11.sp)
+                                    }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        TextButton(
+                                            onClick = {
+                                                selectedMediaIndex = index
+                                                showGalleryList = false
+                                            }
+                                        ) {
+                                            Text("Open", color = Color.White)
+                                        }
+                                        TextButton(
+                                            onClick = {
+                                                showGalleryList = false
+                                                jumpToPostInThread(media.postNo)
+                                            }
+                                        ) {
+                                            Text("Jump to post", color = LoadingGreen)
+                                        }
                                     }
                                 }
                             }
@@ -1268,9 +1420,12 @@ fun ThreadScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .graphicsLayer {
-                            translationX = overlayTranslationX(swipeX)
-                            translationY = (swipeY * OVERLAY_DRAG_DAMP).coerceIn(-OVERLAY_DRAG_CLAMP, OVERLAY_DRAG_CLAMP)
+                        .offset {
+                            val translationX = overlayTranslationX(swipeX).roundToInt()
+                            val translationY = (swipeY * OVERLAY_DRAG_DAMP)
+                                .coerceIn(-OVERLAY_DRAG_CLAMP, OVERLAY_DRAG_CLAMP)
+                                .roundToInt()
+                            IntOffset(translationX, translationY)
                         }
                         .pointerInput(currentMedia.url, currentIndex, scale) {
                             var swipeEnabled = false
@@ -1408,6 +1563,10 @@ fun ThreadScreen(
                     BottomOverlayButton(text = "Save", onClick = {
                         pendingSave = currentMedia
                         saveMediaLauncher.launch(currentMedia.fileName)
+                    })
+                    BottomOverlayButton(text = "Post", onClick = {
+                        selectedMediaIndex = -1
+                        jumpToPostInThread(currentMedia.postNo)
                     })
                     BottomOverlayButton(text = "Gallery", onClick = {
                         selectedMediaIndex = -1

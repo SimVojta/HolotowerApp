@@ -2,6 +2,9 @@ package com.holotower.app.navigation
 
 import android.webkit.WebView
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.collectAsState
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -13,29 +16,49 @@ import com.holotower.app.ui.globalentry.GlobalEntryScreen
 import com.holotower.app.ui.thread.NewThreadComposerScreen
 import com.holotower.app.ui.thread.ThreadScreen
 
+private const val ROUTE_CLOUDFLARE = "cloudflare"
+private const val ROUTE_CATALOG = "catalog"
+private const val RESULT_FORCE_REFRESH_AFTER_CLOUDFLARE = "force_refresh_after_cloudflare"
+
 @Composable
 fun NavGraph(board: String = "hlgg", sharedWebView: WebView) {
     val navController = rememberNavController()
 
     NavHost(
         navController = navController,
-        startDestination = "cloudflare"
+        startDestination = ROUTE_CLOUDFLARE
     ) {
-        composable("cloudflare") {
+        composable(ROUTE_CLOUDFLARE) {
             CloudflareScreen(
                 targetUrl = "https://holotower.org/$board/",
                 sharedWebView = sharedWebView,
                 onChallengePassed = {
-                    navController.navigate("catalog") {
-                        popUpTo("cloudflare") { inclusive = true }
+                    val previousEntry = navController.previousBackStackEntry
+                    if (previousEntry != null) {
+                        previousEntry.savedStateHandle[RESULT_FORCE_REFRESH_AFTER_CLOUDFLARE] =
+                            System.currentTimeMillis()
+                        navController.popBackStack()
+                    } else {
+                        navController.navigate(ROUTE_CATALOG) {
+                            popUpTo(ROUTE_CLOUDFLARE) { inclusive = true }
+                        }
                     }
                 }
             )
         }
 
-        composable("catalog") {
+        composable(ROUTE_CATALOG) { backStackEntry ->
+            val refreshToken by backStackEntry.savedStateHandle
+                .getStateFlow(RESULT_FORCE_REFRESH_AFTER_CLOUDFLARE, 0L)
+                .collectAsState()
+            LaunchedEffect(refreshToken) {
+                if (refreshToken != 0L) {
+                    backStackEntry.savedStateHandle[RESULT_FORCE_REFRESH_AFTER_CLOUDFLARE] = 0L
+                }
+            }
             CatalogScreen(
                 board = board,
+                refreshAfterCloudflareToken = refreshToken,
                 onThreadClick = { threadNo ->
                     navController.navigate("thread/$threadNo")
                 },
@@ -46,8 +69,8 @@ fun NavGraph(board: String = "hlgg", sharedWebView: WebView) {
                     navController.navigate("global-entry")
                 },
                 onRefreshCloudflare = {
-                    navController.navigate("cloudflare") {
-                        popUpTo("catalog") { inclusive = true }
+                    navController.navigate(ROUTE_CLOUDFLARE) {
+                        launchSingleTop = true
                     }
                 }
             )
@@ -71,9 +94,18 @@ fun NavGraph(board: String = "hlgg", sharedWebView: WebView) {
             arguments = listOf(navArgument("threadNo") { type = NavType.LongType })
         ) { backStackEntry ->
             val threadNo = backStackEntry.arguments?.getLong("threadNo") ?: 0L
+            val refreshToken by backStackEntry.savedStateHandle
+                .getStateFlow(RESULT_FORCE_REFRESH_AFTER_CLOUDFLARE, 0L)
+                .collectAsState()
+            LaunchedEffect(refreshToken) {
+                if (refreshToken != 0L) {
+                    backStackEntry.savedStateHandle[RESULT_FORCE_REFRESH_AFTER_CLOUDFLARE] = 0L
+                }
+            }
             ThreadScreen(
                 board = board,
                 threadNo = threadNo,
+                refreshAfterCloudflareToken = refreshToken,
                 onBack = { navController.popBackStack() },
                 onOpenThread = { targetThreadNo ->
                     navController.navigate("thread/$targetThreadNo") {
@@ -81,8 +113,7 @@ fun NavGraph(board: String = "hlgg", sharedWebView: WebView) {
                     }
                 },
                 onRefreshCloudflare = {
-                    navController.navigate("cloudflare") {
-                        popUpTo("catalog") { inclusive = false }
+                    navController.navigate(ROUTE_CLOUDFLARE) {
                         launchSingleTop = true
                     }
                 }

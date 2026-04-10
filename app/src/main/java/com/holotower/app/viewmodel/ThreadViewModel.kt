@@ -5,6 +5,8 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.holotower.app.data.model.Post
 import com.holotower.app.data.repository.BoardRepository
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -21,6 +23,7 @@ class ThreadViewModel(
     private val repo: BoardRepository = BoardRepository()
 ) : ViewModel() {
 
+    private var loadJob: Job? = null
     private val _state = MutableStateFlow<ThreadUiState>(ThreadUiState.Loading)
     val state: StateFlow<ThreadUiState> = _state
 
@@ -28,12 +31,30 @@ class ThreadViewModel(
         load()
     }
 
-    fun load(forceRefresh: Boolean = false) {
-        viewModelScope.launch {
+    fun load(forceRefresh: Boolean = false, retryOnFailure: Boolean = false) {
+        loadJob?.cancel()
+        loadJob = viewModelScope.launch {
             _state.value = ThreadUiState.Loading
-            runCatching { repo.getThreadPosts(board, threadNo, forceRefresh = forceRefresh) }
-                .onSuccess { _state.value = ThreadUiState.Success(it) }
-                .onFailure { _state.value = ThreadUiState.Error(it.message ?: "Unknown error") }
+            val firstAttempt = runCatching { repo.getThreadPosts(board, threadNo, forceRefresh = forceRefresh) }
+            if (firstAttempt.isSuccess) {
+                _state.value = ThreadUiState.Success(firstAttempt.getOrThrow())
+                return@launch
+            }
+            if (retryOnFailure) {
+                delay(700)
+                val retryAttempt = runCatching { repo.getThreadPosts(board, threadNo, forceRefresh = true) }
+                if (retryAttempt.isSuccess) {
+                    _state.value = ThreadUiState.Success(retryAttempt.getOrThrow())
+                    return@launch
+                }
+                _state.value = ThreadUiState.Error(
+                    retryAttempt.exceptionOrNull()?.message
+                        ?: firstAttempt.exceptionOrNull()?.message
+                        ?: "Unknown error"
+                )
+            } else {
+                _state.value = ThreadUiState.Error(firstAttempt.exceptionOrNull()?.message ?: "Unknown error")
+            }
         }
     }
 

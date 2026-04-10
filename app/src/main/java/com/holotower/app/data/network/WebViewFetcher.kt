@@ -15,6 +15,8 @@ import com.google.gson.reflect.TypeToken
 import com.holotower.app.data.model.CatalogPage
 import com.holotower.app.data.model.ThreadResponse
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -56,20 +58,22 @@ object WebViewFetcher {
     private val gson = Gson()
     private val idCounter = AtomicInteger(0)
     private const val MAX_CHALLENGE_HOPS = 5
+    private val fetchMutex = Mutex()
 
     suspend fun fetchJson(url: String): String {
-        val wv = webView ?: run {
-            Log.e(TAG, "fetchJson: webView is NULL")
-            throw IllegalStateException("WebView is null")
-        }
+        return fetchMutex.withLock {
+            val wv = webView ?: run {
+                Log.e(TAG, "fetchJson: webView is NULL")
+                throw IllegalStateException("WebView is null")
+            }
 
-        Log.i(TAG, "fetchJson: url=$url")
-        Log.d(TAG, "fetchJson: isAttachedToWindow=${wv.isAttachedToWindow} parent=${wv.parent}")
+            Log.i(TAG, "fetchJson: url=$url")
+            Log.d(TAG, "fetchJson: isAttachedToWindow=${wv.isAttachedToWindow} parent=${wv.parent}")
 
-        val id = idCounter.getAndIncrement()
+            val id = idCounter.getAndIncrement()
 
-        return withTimeout(60_000) {
-            suspendCancellableCoroutine { cont ->
+            withTimeout(60_000) {
+                suspendCancellableCoroutine { cont ->
                 Log.i(TAG, "[id=$id] Starting nav-based fetch")
 
                 WebViewBridge.register(id) { data ->
@@ -89,7 +93,10 @@ object WebViewFetcher {
                 cont.invokeOnCancellation {
                     Log.w(TAG, "[id=$id] Cancelled - cleaning up")
                     WebViewBridge.unregister(id)
-                    mainHandler.post { wv.webViewClient = WebViewClient() }
+                    mainHandler.post {
+                        wv.stopLoading()
+                        wv.webViewClient = WebViewClient()
+                    }
                 }
 
                 mainHandler.post {
@@ -98,7 +105,7 @@ object WebViewFetcher {
                     }
 
                     val sourceUrl = wv.url ?: "about:blank"
-                    val restoreUrl = if (sourceUrl == url) "about:blank" else sourceUrl
+                    val restoreUrl = "about:blank"
                     val referer = if (sourceUrl == "about:blank" || sourceUrl == url) {
                         inferReferer(url)
                     } else {
@@ -115,18 +122,32 @@ object WebViewFetcher {
                     Log.i(TAG, "[id=$id] extraHeaders=$extraHeaders")
 
                     var hopCount = 0
+                    var sawRequestedLoad = false
+                    var delivered = false
 
+                    wv.stopLoading()
                     wv.webViewClient = object : WebViewClient() {
                         override fun onPageStarted(view: WebView, navUrl: String?, favicon: Bitmap?) {
-                            Log.d(TAG, "[id=$id] onPageStarted[$hopCount]: $navUrl")
+                            if (navUrl == url) sawRequestedLoad = true
+                            Log.d(TAG, "[id=$id] onPageStarted[$hopCount]: $navUrl sawRequestedLoad=$sawRequestedLoad")
                         }
 
                         override fun onPageFinished(view: WebView, navUrl: String?) {
-                            Log.i(TAG, "[id=$id] onPageFinished[$hopCount]: $navUrl")
+                            Log.i(TAG, "[id=$id] onPageFinished[$hopCount]: $navUrl sawRequestedLoad=$sawRequestedLoad delivered=$delivered")
+
+                            if (delivered && (navUrl == restoreUrl || navUrl == "about:blank")) {
+                                Log.d(TAG, "[id=$id] Reached restore URL after delivery - clearing WebViewClient")
+                                view.webViewClient = WebViewClient()
+                                return
+                            }
+
+                            if (!sawRequestedLoad && (navUrl == restoreUrl || navUrl == "about:blank" || navUrl == sourceUrl)) {
+                                Log.w(TAG, "[id=$id] Ignoring stale finish before requested load starts: $navUrl")
+                                return
+                            }
 
                             if (navUrl == restoreUrl || navUrl == "about:blank") {
-                                Log.d(TAG, "[id=$id] Reached restore URL - clearing WebViewClient")
-                                view.webViewClient = WebViewClient()
+                                Log.d(TAG, "[id=$id] Ignoring restore URL before delivery")
                                 return
                             }
 
@@ -134,6 +155,7 @@ object WebViewFetcher {
 
                             if (hopCount > MAX_CHALLENGE_HOPS) {
                                 Log.e(TAG, "[id=$id] Exceeded $MAX_CHALLENGE_HOPS hops without JSON")
+                                delivered = true
                                 restoreAndDeliver(view, id, "ERR: Too many Cloudflare hops for $url", restoreUrl)
                                 return
                             }
@@ -160,6 +182,7 @@ object WebViewFetcher {
                                 when {
                                     trimmed.startsWith("[") || trimmed.startsWith("{") -> {
                                         Log.i(TAG, "[id=$id] Valid JSON at hop=$hopCount (${trimmed.length} chars) - delivering")
+                                        delivered = true
                                         restoreAndDeliver(view, id, trimmed, restoreUrl)
                                     }
                                     trimmed.isEmpty() -> {
@@ -189,6 +212,7 @@ object WebViewFetcher {
                                 "[id=$id] onReceivedError: code=$errCode desc=$errDesc url=$errUrl mainFrame=${request?.isForMainFrame}"
                             )
                             if (request?.isForMainFrame == true) {
+                                delivered = true
                                 restoreAndDeliver(
                                     view,
                                     id,
@@ -202,23 +226,25 @@ object WebViewFetcher {
                     Log.i(TAG, "[id=$id] Calling loadUrl($url) with Referer=$referer")
                     wv.loadUrl(url, extraHeaders)
                 }
+                }
             }
         }
     }
 
     suspend fun fetchHtml(url: String, formBody: String? = null): String {
-        val wv = webView ?: run {
-            Log.e(TAG, "fetchHtml: webView is NULL")
-            throw IllegalStateException("WebView is null")
-        }
+        return fetchMutex.withLock {
+            val wv = webView ?: run {
+                Log.e(TAG, "fetchHtml: webView is NULL")
+                throw IllegalStateException("WebView is null")
+            }
 
-        Log.i(TAG, "fetchHtml: url=$url method=${if (formBody == null) "GET" else "POST"}")
-        Log.d(TAG, "fetchHtml: isAttachedToWindow=${wv.isAttachedToWindow} parent=${wv.parent}")
+            Log.i(TAG, "fetchHtml: url=$url method=${if (formBody == null) "GET" else "POST"}")
+            Log.d(TAG, "fetchHtml: isAttachedToWindow=${wv.isAttachedToWindow} parent=${wv.parent}")
 
-        val id = idCounter.getAndIncrement()
+            val id = idCounter.getAndIncrement()
 
-        return withTimeout(60_000) {
-            suspendCancellableCoroutine { cont ->
+            withTimeout(60_000) {
+                suspendCancellableCoroutine { cont ->
                 Log.i(TAG, "[id=$id] Starting nav-based HTML fetch")
 
                 WebViewBridge.register(id) { data ->
@@ -238,7 +264,10 @@ object WebViewFetcher {
                 cont.invokeOnCancellation {
                     Log.w(TAG, "[id=$id] Cancelled HTML fetch - cleaning up")
                     WebViewBridge.unregister(id)
-                    mainHandler.post { wv.webViewClient = WebViewClient() }
+                    mainHandler.post {
+                        wv.stopLoading()
+                        wv.webViewClient = WebViewClient()
+                    }
                 }
 
                 mainHandler.post {
@@ -247,7 +276,7 @@ object WebViewFetcher {
                     }
 
                     val sourceUrl = wv.url ?: "about:blank"
-                    val restoreUrl = if (sourceUrl == url) "about:blank" else sourceUrl
+                    val restoreUrl = "about:blank"
                     val referer = if (sourceUrl == "about:blank" || sourceUrl == url) {
                         inferReferer(url)
                     } else {
@@ -264,18 +293,32 @@ object WebViewFetcher {
                     Log.i(TAG, "[id=$id] extraHeaders=$extraHeaders")
 
                     var hopCount = 0
+                    var sawRequestedLoad = false
+                    var delivered = false
 
+                    wv.stopLoading()
                     wv.webViewClient = object : WebViewClient() {
                         override fun onPageStarted(view: WebView, navUrl: String?, favicon: Bitmap?) {
-                            Log.d(TAG, "[id=$id] onPageStarted[$hopCount]: $navUrl")
+                            if (navUrl == url) sawRequestedLoad = true
+                            Log.d(TAG, "[id=$id] onPageStarted[$hopCount]: $navUrl sawRequestedLoad=$sawRequestedLoad")
                         }
 
                         override fun onPageFinished(view: WebView, navUrl: String?) {
-                            Log.i(TAG, "[id=$id] onPageFinished[$hopCount]: $navUrl")
+                            Log.i(TAG, "[id=$id] onPageFinished[$hopCount]: $navUrl sawRequestedLoad=$sawRequestedLoad delivered=$delivered")
+
+                            if (delivered && (navUrl == restoreUrl || navUrl == "about:blank")) {
+                                Log.d(TAG, "[id=$id] Reached restore URL after delivery - clearing WebViewClient")
+                                view.webViewClient = WebViewClient()
+                                return
+                            }
+
+                            if (!sawRequestedLoad && (navUrl == restoreUrl || navUrl == "about:blank" || navUrl == sourceUrl)) {
+                                Log.w(TAG, "[id=$id] Ignoring stale finish before requested load starts: $navUrl")
+                                return
+                            }
 
                             if (navUrl == restoreUrl || navUrl == "about:blank") {
-                                Log.d(TAG, "[id=$id] Reached restore URL - clearing WebViewClient")
-                                view.webViewClient = WebViewClient()
+                                Log.d(TAG, "[id=$id] Ignoring restore URL before delivery")
                                 return
                             }
 
@@ -283,6 +326,7 @@ object WebViewFetcher {
 
                             if (hopCount > MAX_CHALLENGE_HOPS) {
                                 Log.e(TAG, "[id=$id] Exceeded $MAX_CHALLENGE_HOPS hops without final HTML")
+                                delivered = true
                                 restoreAndDeliver(view, id, "ERR: Too many Cloudflare hops for $url", restoreUrl)
                                 return
                             }
@@ -314,6 +358,7 @@ object WebViewFetcher {
                                     }
                                     else -> {
                                         Log.i(TAG, "[id=$id] Final HTML captured at hop=$hopCount (${html.length} chars)")
+                                        delivered = true
                                         restoreAndDeliver(view, id, html, restoreUrl)
                                     }
                                 }
@@ -333,6 +378,7 @@ object WebViewFetcher {
                                 "[id=$id] onReceivedError: code=$errCode desc=$errDesc url=$errUrl mainFrame=${request?.isForMainFrame}"
                             )
                             if (request?.isForMainFrame == true) {
+                                delivered = true
                                 restoreAndDeliver(
                                     view,
                                     id,
@@ -347,9 +393,11 @@ object WebViewFetcher {
                         Log.i(TAG, "[id=$id] Calling loadUrl($url) with Referer=$referer")
                         wv.loadUrl(url, extraHeaders)
                     } else {
+                        sawRequestedLoad = true
                         Log.i(TAG, "[id=$id] Calling postUrl($url) with body length=${formBody.length}")
                         wv.postUrl(url, formBody.toByteArray(Charsets.UTF_8))
                     }
+                }
                 }
             }
         }

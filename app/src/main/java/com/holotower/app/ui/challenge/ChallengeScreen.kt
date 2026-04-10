@@ -19,6 +19,8 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -28,7 +30,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.google.gson.Gson
+import com.holotower.app.data.network.ForegroundChallengePolicy
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -86,15 +92,34 @@ fun CloudflareScreen(
     onChallengePassed: () -> Unit
 ) {
     val coroutineScope = rememberCoroutineScope()
+    val lifecycleOwner = LocalLifecycleOwner.current
     var waitingForChallenge by remember { mutableStateOf(true) }
     var hintText by remember { mutableStateOf("Checking access...") }
+    var reloadToken by remember(targetUrl) { mutableIntStateOf(0) }
+    var lastHandledBackgroundToken by remember(targetUrl) { mutableLongStateOf(0L) }
 
     Log.i(TAG, "CloudflareScreen composing. targetUrl=$targetUrl")
 
-    DisposableEffect(targetUrl) {
+    DisposableEffect(lifecycleOwner, targetUrl) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event != Lifecycle.Event.ON_START) return@LifecycleEventObserver
+            val backgroundToken = ForegroundChallengePolicy.backgroundToken()
+            val shouldReload = backgroundToken != lastHandledBackgroundToken &&
+                ForegroundChallengePolicy.shouldRecheckFor(backgroundToken)
+            if (shouldReload) {
+                lastHandledBackgroundToken = backgroundToken
+                reloadToken += 1
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    DisposableEffect(targetUrl, reloadToken) {
         var pollJob: Job? = null
         var lastTouchAtMs = 0L
         var challengeShown = false
+        var handoffCompleted = false
 
         Log.i(TAG, "DisposableEffect: making WebView full-screen for challenge")
         Log.d(
@@ -103,7 +128,9 @@ fun CloudflareScreen(
         )
 
         waitingForChallenge = true
-        hintText = "Checking access..."
+        hintText = if (reloadToken == 0) "Checking access..." else "Refreshing security check..."
+
+        sharedWebView.stopLoading()
 
         sharedWebView.layoutParams = FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
@@ -132,6 +159,7 @@ fun CloudflareScreen(
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
+                if (handoffCompleted) return
                 super.onPageFinished(view, url)
                 val checkUrl = url ?: targetUrl
                 Log.i(TAG, "onPageFinished: url=$url - starting JSON/challenge poll")
@@ -158,10 +186,17 @@ fun CloudflareScreen(
 
                         if (looksLikeJson(body) || (hasClearance && !challengeActive)) {
                             Log.i(TAG, "Challenge cleared on attempt $i. Flushing cookies and navigating.")
+                            handoffCompleted = true
                             CookieManager.getInstance().flush()
                             waitingForChallenge = false
+                            hintText = "Access granted. Loading..."
+                            pollJob?.cancel()
+                            sharedWebView.setOnTouchListener(null)
+                            sharedWebView.stopLoading()
+                            sharedWebView.webViewClient = WebViewClient()
+                            sharedWebView.webChromeClient = WebChromeClient()
                             hideSharedWebView(sharedWebView)
-                            onChallengePassed()
+                            sharedWebView.postDelayed({ onChallengePassed() }, 250L)
                             return@launch
                         }
 
@@ -193,6 +228,7 @@ fun CloudflareScreen(
                 description: String?,
                 failingUrl: String?
             ) {
+                if (handoffCompleted) return
                 super.onReceivedError(view, errorCode, description, failingUrl)
                 Log.e(TAG, "onReceivedError: code=$errorCode description=$description url=$failingUrl")
             }

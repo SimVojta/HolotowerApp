@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -40,6 +41,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -49,8 +51,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -59,13 +61,18 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil3.compose.AsyncImage
 import com.holotower.app.R
 import com.holotower.app.data.model.CatalogThread
+import com.holotower.app.data.network.ForegroundChallengePolicy
 import com.holotower.app.viewmodel.CatalogUiState
 import com.holotower.app.viewmodel.CatalogViewModel
 import kotlinx.coroutines.delay
+import kotlin.math.roundToInt
 
 private enum class CatalogSortMode {
     BumpOrder,
@@ -86,10 +93,12 @@ fun CatalogScreen(
     onThreadClick: (Long) -> Unit,
     onNewThreadSwipe: () -> Unit = {},
     onGlobalEntryClick: () -> Unit = {},
+    refreshAfterCloudflareToken: Long = 0L,
     onRefreshCloudflare: (() -> Unit)? = null,
     vm: CatalogViewModel = viewModel()
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val prefs = remember(context) {
         context.getSharedPreferences("catalog_filters", Context.MODE_PRIVATE)
     }
@@ -178,8 +187,30 @@ fun CatalogScreen(
     LaunchedEffect(board) {
         vm.load(boardName = board)
     }
+    LaunchedEffect(board, refreshAfterCloudflareToken) {
+        if (refreshAfterCloudflareToken != 0L) {
+            delay(350)
+            vm.load(boardName = board, forceRefresh = true, retryOnFailure = true)
+        }
+    }
 
     var swipeX by remember { mutableStateOf(0f) }
+    var lastHandledBackgroundToken by remember { mutableStateOf(0L) }
+
+    DisposableEffect(lifecycleOwner, onRefreshCloudflare) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event != Lifecycle.Event.ON_START || onRefreshCloudflare == null) return@LifecycleEventObserver
+            val backgroundToken = ForegroundChallengePolicy.backgroundToken()
+            val shouldRefresh = backgroundToken != lastHandledBackgroundToken &&
+                ForegroundChallengePolicy.shouldRecheckFor(backgroundToken)
+            if (shouldRefresh) {
+                lastHandledBackgroundToken = backgroundToken
+                onRefreshCloudflare()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     Scaffold(
         topBar = {
@@ -276,9 +307,11 @@ fun CatalogScreen(
             Modifier
                 .padding(padding)
                 .fillMaxSize()
-                .graphicsLayer {
+                .offset {
                     val clamped = swipeX.coerceIn(-OVERLAY_DRAG_CLAMP, 0f)
-                    translationX = (clamped * OVERLAY_DRAG_DAMP).coerceIn(-OVERLAY_DRAG_CLAMP, OVERLAY_DRAG_CLAMP)
+                    val translation = (clamped * OVERLAY_DRAG_DAMP)
+                        .coerceIn(-OVERLAY_DRAG_CLAMP, OVERLAY_DRAG_CLAMP)
+                    IntOffset(translation.roundToInt(), 0)
                 }
                 .pullRefresh(pullRefreshState)
                 .pointerInput(onNewThreadSwipe) {

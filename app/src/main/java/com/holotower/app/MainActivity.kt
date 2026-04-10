@@ -14,6 +14,7 @@ import coil3.ImageLoader
 import coil3.compose.setSingletonImageLoaderFactory
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import com.holotower.app.data.network.CloudflareHelper
+import com.holotower.app.data.network.ForegroundChallengePolicy
 import com.holotower.app.data.network.WebViewBridge
 import com.holotower.app.data.network.WebViewFetcher
 import com.holotower.app.navigation.NavGraph
@@ -25,6 +26,8 @@ import java.util.concurrent.TimeUnit
 private const val TAG = "MainActivity"
 
 class MainActivity : ComponentActivity() {
+    private lateinit var sharedWebView: WebView
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Log.i(TAG, "onCreate: starting")
@@ -35,7 +38,7 @@ class MainActivity : ComponentActivity() {
             isAppearanceLightNavigationBars = false
         }
 
-        val sharedWebView = WebView(this).apply {
+        sharedWebView = WebView(this).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             setBackgroundColor(Color.BLACK)
@@ -99,6 +102,19 @@ class MainActivity : ComponentActivity() {
             }
             NavGraph(board = "hlgg", sharedWebView = sharedWebView)
         }
+    }
+
+    override fun onPause() {
+        sharedWebView.onPause()
+        sharedWebView.pauseTimers()
+        ForegroundChallengePolicy.onAppBackgrounded()
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        sharedWebView.onResume()
+        sharedWebView.resumeTimers()
     }
 
     override fun onDestroy() {

@@ -1,4 +1,4 @@
-# HoloTowerApp
+# HolotowerApp
 
 Unofficial Android client for browsing Holotower.
 

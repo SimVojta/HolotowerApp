@@ -15,8 +15,9 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -28,6 +29,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
@@ -64,6 +67,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -72,6 +76,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.IntOffset
@@ -115,6 +120,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 import kotlin.math.abs
+import kotlin.math.sqrt
 import kotlin.math.roundToInt
 
 private val BackgroundColor = Color(0xFF111111)
@@ -145,6 +151,7 @@ private const val JUMP_TO_LATEST_DISTANCE_THRESHOLD = 12
 private const val JUMP_TO_LATEST_VISIBLE_MS = 5_000L
 
 private enum class MediaKind { Image, Video }
+private enum class GalleryFilter { All, Images, Videos }
 private enum class SwipeAxis { Undecided, Horizontal, Vertical }
 
 private data class GalleryMediaItem(
@@ -230,7 +237,7 @@ private fun inferReferer(url: String): String {
 }
 
 @Composable
-fun ErrorView(message: String, onRetry: () -> Unit) {
+fun ErrorView(message: String, onRetry: () -> Unit, onRefreshCloudflare: (() -> Unit)? = null) {
     Column(
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.Center,
@@ -244,8 +251,18 @@ fun ErrorView(message: String, onRetry: () -> Unit) {
         ) {
             Text("Retry", color = Color.White)
         }
+        if (onRefreshCloudflare != null && isCloudflareChallengeError(message)) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Button(onClick = onRefreshCloudflare) {
+                Text("Open Cloudflare check")
+            }
+        }
     }
 }
+
+private fun isCloudflareChallengeError(message: String): Boolean =
+    message.contains("cloudflare", ignoreCase = true) ||
+        message.contains("security check", ignoreCase = true)
 
 private suspend fun loadMiniThreadConversation(
     selection: MiniThreadSelection,
@@ -614,7 +631,7 @@ private fun VerticalProgressBar(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class, FlowPreview::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class, FlowPreview::class)
 @Composable
 fun ThreadScreen(
     board: String,
@@ -623,6 +640,7 @@ fun ThreadScreen(
     onBack: () -> Unit,
     onOpenThread: (Long) -> Unit = {},
     onRefreshCloudflare: (() -> Unit)? = null,
+    isCurrentDestination: Boolean = true,
     vm: ThreadViewModel = viewModel(factory = ThreadViewModel.Factory(board, threadNo))
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -630,13 +648,24 @@ fun ThreadScreen(
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val repo = remember { BoardRepository() }
+    val repo = remember(context.applicationContext) { BoardRepository(context.applicationContext) }
 
     val successPosts = (state as? ThreadUiState.Success)?.posts
     var cachedPosts by remember { mutableStateOf<List<Post>>(emptyList()) }
     LaunchedEffect(successPosts) { if (successPosts != null) cachedPosts = successPosts }
     val allPosts = successPosts ?: cachedPosts
     val mediaItems = remember(allPosts, board) { buildMediaItems(allPosts, board) }
+    var galleryFilter by remember { mutableStateOf(GalleryFilter.All) }
+    val galleryMediaItems = remember(mediaItems, galleryFilter) {
+        when (galleryFilter) {
+            GalleryFilter.All -> mediaItems
+            GalleryFilter.Images -> mediaItems.filter { it.kind == MediaKind.Image }
+            GalleryFilter.Videos -> mediaItems.filter { it.kind == MediaKind.Video }
+        }
+    }
+    val postIndexByNo = remember(allPosts) { allPosts.mapIndexed { index, post -> post.no to index }.toMap() }
+    var releasedForBackStack by remember(threadNo) { mutableStateOf(false) }
+
     val threadHeaderSecondLine = remember(allPosts, board, threadNo) {
         buildThreadHeaderSecondaryLine(board = board, posts = allPosts, threadNo = threadNo)
     }
@@ -656,10 +685,41 @@ fun ThreadScreen(
     var selectedMiniThread by remember { mutableStateOf<MiniThreadSelection?>(null) }
     var miniThreadUiState by remember { mutableStateOf<MiniThreadUiState>(MiniThreadUiState.Idle) }
     var showGalleryList by remember { mutableStateOf(false) }
+    var galleryScrollTargetPostNo by remember { mutableStateOf<Long?>(null) }
     var replyComposerTargetNo by remember { mutableStateOf<Long?>(null) }
     val mediaOverlayOpen = selectedMediaIndex in mediaItems.indices
     val anyOverlayOpen = selectedMiniThread != null || showGalleryList || mediaOverlayOpen || replyComposerTargetNo != null
     var hasRestoredScroll by remember(threadNo) { mutableStateOf(false) }
+    LaunchedEffect(threadNo, isCurrentDestination, allPosts) {
+        if (!isCurrentDestination && !releasedForBackStack) {
+            if (hasRestoredScroll && allPosts.isNotEmpty()) {
+                val safeIndex = listState.firstVisibleItemIndex.coerceIn(0, allPosts.lastIndex)
+                allPosts.getOrNull(safeIndex)?.let { post ->
+                    ThreadPositionStore.save(
+                        context = context,
+                        board = board,
+                        threadNo = threadNo,
+                        postNo = post.no,
+                        index = safeIndex,
+                        offset = listState.firstVisibleItemScrollOffset
+                    )
+                }
+            }
+            releasedForBackStack = true
+            cachedPosts = emptyList()
+            selectedMediaIndex = -1
+            showGalleryList = false
+            pendingSave = null
+            selectedMiniThread = null
+            miniThreadUiState = MiniThreadUiState.Idle
+            replyComposerTargetNo = null
+            hasRestoredScroll = false
+            vm.releasePosts()
+        } else if (isCurrentDestination) {
+            releasedForBackStack = false
+            vm.reloadAfterRelease()
+        }
+    }
     val isAtBottom by remember(listState, allPosts) {
         derivedStateOf {
             val info = listState.layoutInfo
@@ -690,8 +750,8 @@ fun ThreadScreen(
         hasRestoredScroll = true
     }
 
-    LaunchedEffect(board, threadNo, allPosts) {
-        if (allPosts.isEmpty()) return@LaunchedEffect
+    LaunchedEffect(board, threadNo, allPosts, hasRestoredScroll) {
+        if (!hasRestoredScroll || allPosts.isEmpty()) return@LaunchedEffect
         snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
             .distinctUntilChanged()
             .debounce(500)
@@ -709,9 +769,11 @@ fun ThreadScreen(
             }
     }
 
-    DisposableEffect(board, threadNo, allPosts) {
+    DisposableEffect(board, threadNo, allPosts, hasRestoredScroll) {
         onDispose {
-            if (allPosts.isEmpty()) return@onDispose
+            // The initial list position is not the user's reading position. Never
+            // let disposal during restoration overwrite the saved post with index 0.
+            if (!hasRestoredScroll || allPosts.isEmpty()) return@onDispose
             val safeIndex = listState.firstVisibleItemIndex.coerceIn(0, allPosts.lastIndex.coerceAtLeast(0))
             val postNo = allPosts.getOrNull(safeIndex)?.no ?: return@onDispose
             ThreadPositionStore.save(
@@ -733,9 +795,9 @@ fun ThreadScreen(
     }
 
     var lastHandledBackgroundToken by remember(threadNo) { mutableStateOf(0L) }
-    DisposableEffect(lifecycleOwner, onRefreshCloudflare, anyOverlayOpen, threadNo) {
+    DisposableEffect(lifecycleOwner, anyOverlayOpen, threadNo) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event != Lifecycle.Event.ON_START || onRefreshCloudflare == null || anyOverlayOpen) {
+            if (event != Lifecycle.Event.ON_START || anyOverlayOpen) {
                 return@LifecycleEventObserver
             }
             val backgroundToken = ForegroundChallengePolicy.backgroundToken()
@@ -743,7 +805,9 @@ fun ThreadScreen(
                 ForegroundChallengePolicy.shouldRecheckFor(backgroundToken)
             if (shouldRefresh) {
                 lastHandledBackgroundToken = backgroundToken
-                onRefreshCloudflare()
+                // Refresh in place so returning to a long-lived thread does not
+                // replace the screen with a challenge while cached posts are usable.
+                vm.load(forceRefresh = true, retryOnFailure = true)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -798,7 +862,12 @@ fun ThreadScreen(
     }
 
     val renderPostList: @Composable (List<Post>) -> Unit = { posts ->
-        val backlinksByPostNo = buildBacklinks(posts)
+        val backlinksByPostNo by produceState<Map<Long, List<Long>>>(
+            initialValue = emptyMap(),
+            key1 = posts
+        ) {
+            value = withContext(Dispatchers.Default) { buildBacklinks(posts) }
+        }
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             state = listState,
@@ -829,9 +898,9 @@ fun ThreadScreen(
     }
 
     val jumpToPostInThread: (Long) -> Unit = { targetPostNo ->
-        val index = allPosts.indexOfFirst { it.no == targetPostNo }
-        if (index >= 0) {
-            scope.launch { listState.animateScrollToItem(index) }
+        val index = postIndexByNo[targetPostNo]
+        if (index != null) {
+            scope.launch { listState.scrollToItem(index) }
         } else {
             Toast.makeText(context, "Post not found in loaded thread", Toast.LENGTH_SHORT).show()
         }
@@ -839,7 +908,7 @@ fun ThreadScreen(
 
     val jumpToLatestPost: () -> Unit = {
         if (allPosts.isNotEmpty()) {
-            scope.launch { listState.animateScrollToItem(allPosts.lastIndex) }
+            scope.launch { listState.scrollToItem(allPosts.lastIndex) }
         }
     }
     var showJumpToLatestChip by remember(threadNo) { mutableStateOf(false) }
@@ -967,7 +1036,43 @@ fun ThreadScreen(
                             renderPostList(cachedPosts)
                         }
                     }
-                    is ThreadUiState.Error -> ErrorView(message = s.message, onRetry = { vm.load(forceRefresh = true) })
+                    is ThreadUiState.Error -> {
+                        if (cachedPosts.isEmpty()) {
+                            ErrorView(
+                                message = s.message,
+                                onRetry = { vm.load(forceRefresh = true, retryOnFailure = true) },
+                                onRefreshCloudflare = onRefreshCloudflare
+                            )
+                        } else {
+                            renderPostList(cachedPosts)
+                            Column(
+                                modifier = Modifier
+                                    .align(Alignment.TopCenter)
+                                    .fillMaxWidth()
+                                    .background(Color(0xEE111111))
+                                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text(
+                                    text = "Refresh failed: ${s.message}",
+                                    color = Color(0xFFE9FFF5),
+                                    fontSize = 12.sp,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    TextButton(onClick = { vm.load(forceRefresh = true, retryOnFailure = true) }) {
+                                        Text("Retry", color = LoadingGreen)
+                                    }
+                                    if (onRefreshCloudflare != null && isCloudflareChallengeError(s.message)) {
+                                        TextButton(onClick = onRefreshCloudflare) {
+                                            Text("Open Cloudflare check", color = LoadingGreen)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     is ThreadUiState.Success -> renderPostList(s.posts)
                 }
 
@@ -1139,7 +1244,7 @@ fun ThreadScreen(
                                     (hintedThreadNo == null || scoped.threadNo == hintedThreadNo)
                             }
                             if (index >= 0) {
-                                scope.launch { miniListState.animateScrollToItem(index) }
+                                scope.launch { miniListState.scrollToItem(index) }
                                 true
                             } else {
                                 false
@@ -1257,6 +1362,12 @@ fun ThreadScreen(
     if (showGalleryList) {
         var swipeX by remember { mutableFloatStateOf(0f) }
         val galleryListState = rememberLazyListState()
+        LaunchedEffect(galleryScrollTargetPostNo, galleryMediaItems) {
+            val targetPostNo = galleryScrollTargetPostNo ?: return@LaunchedEffect
+            val targetIndex = galleryMediaItems.indexOfFirst { it.postNo == targetPostNo }
+            if (targetIndex >= 0) galleryListState.scrollToItem(targetIndex)
+            galleryScrollTargetPostNo = null
+        }
         BackHandler { showGalleryList = false }
         Box(
             modifier = Modifier
@@ -1293,13 +1404,43 @@ fun ThreadScreen(
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
                     fontWeight = FontWeight.Bold
                 )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    GalleryFilter.entries.forEach { filter ->
+                        val selected = galleryFilter == filter
+                        TextButton(
+                            onClick = { galleryFilter = filter },
+                            modifier = Modifier
+                                .padding(horizontal = 3.dp)
+                                .background(
+                                    color = if (selected) Color(0xFF5E4A8A) else Color(0xFF202020),
+                                    shape = RoundedCornerShape(16.dp)
+                                )
+                        ) {
+                            Text(
+                                text = when (filter) {
+                                    GalleryFilter.All -> "ALL"
+                                    GalleryFilter.Images -> "IMG"
+                                    GalleryFilter.Videos -> "VID"
+                                },
+                                color = Color.White,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+                }
                 Box(modifier = Modifier.weight(1f)) {
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
                         state = galleryListState,
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
                     ) {
-                        itemsIndexed(mediaItems, key = { _, item -> item.postNo }) { index, media ->
+                        itemsIndexed(galleryMediaItems, key = { _, item -> item.postNo }) { _, media ->
+                            val mediaIndex = mediaItems.indexOfFirst { it.url == media.url }
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -1327,7 +1468,7 @@ fun ThreadScreen(
                                         modifier = Modifier
                                             .size(72.dp)
                                             .clickable {
-                                                selectedMediaIndex = index
+                                                selectedMediaIndex = mediaIndex
                                                 showGalleryList = false
                                             },
                                         contentScale = ContentScale.Crop
@@ -1356,7 +1497,7 @@ fun ThreadScreen(
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         TextButton(
                                             onClick = {
-                                                selectedMediaIndex = index
+                                                selectedMediaIndex = mediaIndex
                                                 showGalleryList = false
                                             }
                                         ) {
@@ -1427,71 +1568,112 @@ fun ThreadScreen(
                                 .roundToInt()
                             IntOffset(translationX, translationY)
                         }
-                        .pointerInput(currentMedia.url, currentIndex, scale) {
-                            var swipeEnabled = false
-                            val topExclusion = 120.dp.toPx()
-                            val bottomExclusion = 170.dp.toPx()
-                            detectDragGestures(
-                                onDragStart = { start ->
-                                    swipeEnabled = start.y > topExclusion &&
-                                        start.y < (size.height - bottomExclusion)
-                                },
-                                onDrag = { change, dragAmount ->
-                                    if (!swipeEnabled) return@detectDragGestures
-                                    val canSwipe = currentMedia.kind == MediaKind.Video || scale <= 1.05f
-                                    if (!canSwipe) return@detectDragGestures
+                        .pointerInput(currentMedia.url, currentIndex) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                val topExclusion = 120.dp.toPx()
+                                val bottomExclusion = 170.dp.toPx()
+                                val swipeEnabled = down.position.y > topExclusion &&
+                                    down.position.y < (size.height - bottomExclusion)
+                                var wasMultiTouch = false
+                                var accumulatedDrag = Offset.Zero
 
-                                    if (swipeAxis == SwipeAxis.Undecided) {
-                                        val absX = abs(dragAmount.x)
-                                        val absY = abs(dragAmount.y)
-                                        if (absX > 6f || absY > 6f) {
-                                            swipeAxis = if (absX >= absY) SwipeAxis.Horizontal else SwipeAxis.Vertical
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val pressed = event.changes.filter { it.pressed }
+                                    if (pressed.isEmpty()) break
+
+                                    if (pressed.size >= 2 && currentMedia.kind == MediaKind.Image) {
+                                        wasMultiTouch = true
+                                        val currentCentroid = Offset(
+                                            pressed.map { it.position.x }.average().toFloat(),
+                                            pressed.map { it.position.y }.average().toFloat()
+                                        )
+                                        val previousCentroid = Offset(
+                                            pressed.map { it.previousPosition.x }.average().toFloat(),
+                                            pressed.map { it.previousPosition.y }.average().toFloat()
+                                        )
+                                        fun meanRadius(positions: List<Offset>, centroid: Offset): Float =
+                                            positions.map { point ->
+                                                val dx = point.x - centroid.x
+                                                val dy = point.y - centroid.y
+                                                sqrt(dx * dx + dy * dy)
+                                            }.average().toFloat()
+
+                                        val previousPositions = pressed.map { it.previousPosition }
+                                        val currentPositions = pressed.map { it.position }
+                                        val oldRadius = meanRadius(previousPositions, previousCentroid)
+                                        val newRadius = meanRadius(currentPositions, currentCentroid)
+                                        if (oldRadius > 0f && newRadius > 0f) {
+                                            val zoomChange = newRadius / oldRadius
+                                            val newScale = (scale * zoomChange).coerceIn(1f, 5f)
+                                            val appliedZoom = newScale / scale
+                                            offsetX = (offsetX + currentCentroid.x - previousCentroid.x +
+                                                (currentCentroid.x - size.width / 2f) * (1f - appliedZoom))
+                                                .coerceIn(-size.width * (newScale - 1f) / 2f, size.width * (newScale - 1f) / 2f)
+                                            offsetY = (offsetY + currentCentroid.y - previousCentroid.y +
+                                                (currentCentroid.y - size.height / 2f) * (1f - appliedZoom))
+                                                .coerceIn(-size.height * (newScale - 1f) / 2f, size.height * (newScale - 1f) / 2f)
+                                            scale = newScale
+                                        }
+                                        event.changes.forEach { it.consume() }
+                                    } else if (pressed.size == 1 && !wasMultiTouch) {
+                                        val change = pressed.first()
+                                        val dragAmount = change.position - change.previousPosition
+                                        if (currentMedia.kind == MediaKind.Image && scale > 1.05f) {
+                                            offsetX = (offsetX + dragAmount.x)
+                                                .coerceIn(-size.width * (scale - 1f) / 2f, size.width * (scale - 1f) / 2f)
+                                            offsetY = (offsetY + dragAmount.y)
+                                                .coerceIn(-size.height * (scale - 1f) / 2f, size.height * (scale - 1f) / 2f)
+                                            change.consume()
+                                        } else if (swipeEnabled &&
+                                            (currentMedia.kind == MediaKind.Video || scale <= 1.05f)
+                                        ) {
+                                            accumulatedDrag += dragAmount
+                                            if (swipeAxis == SwipeAxis.Undecided &&
+                                                (abs(accumulatedDrag.x) > 6f || abs(accumulatedDrag.y) > 6f)
+                                            ) {
+                                                swipeAxis = if (abs(accumulatedDrag.x) >= abs(accumulatedDrag.y)) {
+                                                    SwipeAxis.Horizontal
+                                                } else {
+                                                    SwipeAxis.Vertical
+                                                }
+                                            }
+                                            when (swipeAxis) {
+                                                SwipeAxis.Horizontal -> {
+                                                    if (dragAmount.x > 0f || swipeX > 0f) {
+                                                        swipeX = (swipeX + dragAmount.x).coerceIn(0f, OVERLAY_DRAG_CLAMP)
+                                                    }
+                                                    swipeY = 0f
+                                                    change.consume()
+                                                }
+                                                SwipeAxis.Vertical -> {
+                                                    swipeY += dragAmount.y
+                                                    swipeX = 0f
+                                                    change.consume()
+                                                }
+                                                SwipeAxis.Undecided -> Unit
+                                            }
                                         }
                                     }
+                                }
 
+                                if (!wasMultiTouch && swipeEnabled) {
                                     when (swipeAxis) {
-                                        SwipeAxis.Horizontal -> {
-                                            if (dragAmount.x > 0f || swipeX > 0f) {
-                                                swipeX = (swipeX + dragAmount.x).coerceIn(0f, OVERLAY_DRAG_CLAMP)
-                                            }
-                                            swipeY = 0f
-                                            change.consume()
+                                        SwipeAxis.Horizontal -> if (swipeX > GALLERY_CLOSE_THRESHOLD) {
+                                            selectedMediaIndex = -1
                                         }
-                                        SwipeAxis.Vertical -> {
-                                            swipeY += dragAmount.y
-                                            swipeX = 0f
-                                            change.consume()
+                                        SwipeAxis.Vertical -> if (abs(swipeY) > GALLERY_NAV_THRESHOLD) {
+                                            if (swipeY < 0f && currentIndex < mediaItems.lastIndex) currentIndex += 1
+                                            else if (swipeY > 0f && currentIndex > 0) currentIndex -= 1
                                         }
                                         SwipeAxis.Undecided -> Unit
                                     }
-                                },
-                                onDragEnd = {
-                                    if (swipeEnabled) {
-                                        when (swipeAxis) {
-                                            SwipeAxis.Horizontal -> {
-                                                if (swipeX > GALLERY_CLOSE_THRESHOLD) selectedMediaIndex = -1
-                                            }
-                                            SwipeAxis.Vertical -> {
-                                                if (abs(swipeY) > GALLERY_NAV_THRESHOLD) {
-                                                    if (swipeY < 0f && currentIndex < mediaItems.lastIndex) currentIndex += 1
-                                                    else if (swipeY > 0f && currentIndex > 0) currentIndex -= 1
-                                                }
-                                            }
-                                            SwipeAxis.Undecided -> Unit
-                                        }
-                                    }
-                                    swipeX = 0f
-                                    swipeY = 0f
-                                    swipeAxis = SwipeAxis.Undecided
-                                    swipeEnabled = false
-                                },
-                                onDragCancel = {
-                                    swipeX = 0f
-                                    swipeY = 0f
-                                    swipeAxis = SwipeAxis.Undecided
-                                    swipeEnabled = false
                                 }
-                            )
+                                swipeX = 0f
+                                swipeY = 0f
+                                swipeAxis = SwipeAxis.Undecided
+                            }
                         }
                 ) {
                     if (currentMedia.kind == MediaKind.Video) {
@@ -1550,12 +1732,14 @@ fun ThreadScreen(
                     }
                 }
 
-                Row(
+                FlowRow(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
                         .navigationBarsPadding()
-                        .padding(12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                        .padding(horizontal = 8.dp, vertical = 12.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     if (currentMedia.kind == MediaKind.Video) {
                         BottomOverlayButton(text = "Open", onClick = { openExternalLink(currentMedia.url) })
@@ -1569,6 +1753,14 @@ fun ThreadScreen(
                         jumpToPostInThread(currentMedia.postNo)
                     })
                     BottomOverlayButton(text = "Gallery", onClick = {
+                        val matchingFilter = when (currentMedia.kind) {
+                            MediaKind.Image -> GalleryFilter.Images
+                            MediaKind.Video -> GalleryFilter.Videos
+                        }
+                        if (galleryFilter != GalleryFilter.All && galleryFilter != matchingFilter) {
+                            galleryFilter = GalleryFilter.All
+                        }
+                        galleryScrollTargetPostNo = currentMedia.postNo
                         selectedMediaIndex = -1
                         showGalleryList = true
                     })

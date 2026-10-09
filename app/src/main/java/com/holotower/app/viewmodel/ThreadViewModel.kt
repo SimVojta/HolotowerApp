@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.holotower.app.data.model.Post
 import com.holotower.app.data.repository.BoardRepository
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -24,6 +25,7 @@ class ThreadViewModel(
 ) : ViewModel() {
 
     private var loadJob: Job? = null
+    private var releasedForMemory = false
     private val _state = MutableStateFlow<ThreadUiState>(ThreadUiState.Loading)
     val state: StateFlow<ThreadUiState> = _state
 
@@ -36,6 +38,7 @@ class ThreadViewModel(
         loadJob = viewModelScope.launch {
             _state.value = ThreadUiState.Loading
             val firstAttempt = runCatching { repo.getThreadPosts(board, threadNo, forceRefresh = forceRefresh) }
+                .onFailure { if (it is CancellationException) throw it }
             if (firstAttempt.isSuccess) {
                 _state.value = ThreadUiState.Success(firstAttempt.getOrThrow())
                 return@launch
@@ -43,6 +46,7 @@ class ThreadViewModel(
             if (retryOnFailure) {
                 delay(700)
                 val retryAttempt = runCatching { repo.getThreadPosts(board, threadNo, forceRefresh = true) }
+                    .onFailure { if (it is CancellationException) throw it }
                 if (retryAttempt.isSuccess) {
                     _state.value = ThreadUiState.Success(retryAttempt.getOrThrow())
                     return@launch
@@ -58,13 +62,27 @@ class ThreadViewModel(
         }
     }
 
+    fun releasePosts() {
+        loadJob?.cancel()
+        loadJob = null
+        releasedForMemory = true
+        _state.value = ThreadUiState.Loading
+    }
+
+    fun reloadAfterRelease() {
+        if (!releasedForMemory) return
+        releasedForMemory = false
+        load()
+    }
+
     class Factory(
         private val board: String,
-        private val threadNo: Long
+        private val threadNo: Long,
+        private val repo: BoardRepository = BoardRepository()
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
-            return ThreadViewModel(board, threadNo) as T
+            return ThreadViewModel(board, threadNo, repo) as T
         }
     }
 }

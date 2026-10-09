@@ -158,7 +158,7 @@ fun CatalogScreen(
     fun applyCatalogViewOptions(threads: List<CatalogThread>): List<CatalogThread> {
         val query = searchQuery.trim().lowercase()
         val filtered = threads.asSequence()
-            .filter { if (onlyWithImages) it.images > 0 else true }
+            .filter { if (onlyWithImages) it.imageReplyCount > 0 || it.tim != null else true }
             .filter { if (hideSticky) !it.isSticky else true }
             .filter { if (hideLocked) !it.isLocked else true }
             .filter { thread ->
@@ -174,10 +174,10 @@ fun CatalogScreen(
         return when (sortMode) {
             CatalogSortMode.BumpOrder -> filtered.sortedByDescending { it.lastModified }
             CatalogSortMode.MostReplies -> filtered.sortedWith(
-                compareByDescending<CatalogThread> { it.replies }.thenByDescending { it.lastModified }
+                compareByDescending<CatalogThread> { it.replyCount }.thenByDescending { it.lastModified }
             )
             CatalogSortMode.MostImages -> filtered.sortedWith(
-                compareByDescending<CatalogThread> { it.images }.thenByDescending { it.lastModified }
+                compareByDescending<CatalogThread> { it.imageReplyCount }.thenByDescending { it.lastModified }
             )
             CatalogSortMode.Newest -> filtered.sortedByDescending { it.time }
             CatalogSortMode.Oldest -> filtered.sortedBy { it.time }
@@ -392,6 +392,11 @@ fun CatalogScreen(
                                 Button(onClick = { vm.load(boardName = board, forceRefresh = true) }) {
                                     Text("Retry")
                                 }
+                                if (s.message.contains("cloudflare", ignoreCase = true) && onRefreshCloudflare != null) {
+                                    Button(onClick = onRefreshCloudflare) {
+                                        Text("Open Cloudflare check")
+                                    }
+                                }
                             }
                         }
 
@@ -486,9 +491,8 @@ fun CatalogCard(thread: CatalogThread, board: String, onClick: (Long) -> Unit) {
             }
 
             Column(Modifier.padding(10.dp)) {
-                val totalImages = (thread.images + thread.omittedImages).coerceAtLeast(0)
                 Text(
-                    "R:${thread.replies}  I:$totalImages",
+                    "R:${thread.replyCount}  I:${thread.imageReplyCount}",
                     color = Color(0xFF00FF9F),
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold

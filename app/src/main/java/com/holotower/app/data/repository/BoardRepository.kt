@@ -1,15 +1,20 @@
 package com.holotower.app.data.repository
 
+import android.content.Context
 import android.text.Html
+import com.google.gson.Gson
 import com.holotower.app.data.model.CatalogThread
 import com.holotower.app.data.model.GlobalEntryStatus
 import com.holotower.app.data.model.Post
+import com.holotower.app.data.model.ThreadResponse
+import com.holotower.app.data.local.ThreadDiskCache
 import com.holotower.app.data.network.WebViewFetcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.URLEncoder
 
-class BoardRepository {
+class BoardRepository(context: Context? = null) {
+    private val threadDiskCache = context?.let(::ThreadDiskCache)
 
     suspend fun getCatalogThreads(board: String, forceRefresh: Boolean = false): List<CatalogThread> {
         if (!forceRefresh) {
@@ -26,18 +31,23 @@ class BoardRepository {
     }
 
     suspend fun getThreadPosts(board: String, threadNo: Long, forceRefresh: Boolean = false): List<Post> {
-        val key = "$board:$threadNo"
         if (!forceRefresh) {
-            synchronized(threadCache) {
-                threadCache[key]?.takeIf { isFresh(it.timestampMs) }?.let { return it.data }
+            val cachedJson = threadDiskCache?.read(board, threadNo)
+            if (cachedJson != null) {
+                val posts = runCatching { parseThread(cachedJson) }.getOrNull()
+                if (posts != null) return posts
+                threadDiskCache.remove(board, threadNo)
             }
         }
 
-        val fresh = WebViewFetcher.getThread(board, threadNo).posts
-        synchronized(threadCache) {
-            threadCache[key] = CacheEntry(fresh, System.currentTimeMillis())
-        }
+        val json = WebViewFetcher.fetchThreadJson(board, threadNo)
+        val fresh = parseThread(json)
+        threadDiskCache?.write(board, threadNo, json)
         return fresh
+    }
+
+    private suspend fun parseThread(json: String): List<Post> = withContext(Dispatchers.Default) {
+        gson.fromJson(json, ThreadResponse::class.java).posts
     }
 
     suspend fun getGlobalEntryStatus(forceRefresh: Boolean = false): GlobalEntryStatus {
@@ -163,6 +173,7 @@ class BoardRepository {
 
     companion object {
         private const val CACHE_TTL_MS = 2 * 60 * 1000L
+        private val gson = Gson()
 
         private data class CacheEntry<T>(
             val data: T,
@@ -170,12 +181,12 @@ class BoardRepository {
         )
 
         private val catalogCache = mutableMapOf<String, CacheEntry<List<CatalogThread>>>()
-        private val threadCache = mutableMapOf<String, CacheEntry<List<Post>>>()
         private val globalEntryCacheLock = Any()
         private var globalEntryCache: CacheEntry<GlobalEntryStatus>? = null
 
         private fun isFresh(timestampMs: Long): Boolean {
             return System.currentTimeMillis() - timestampMs < CACHE_TTL_MS
         }
+
     }
 }

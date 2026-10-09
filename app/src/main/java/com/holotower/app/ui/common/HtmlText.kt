@@ -6,7 +6,8 @@ import android.text.style.URLSpan
 import androidx.compose.foundation.text.ClickableText
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.produceState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
@@ -16,6 +17,9 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.unit.TextUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.util.LinkedHashMap
 
 private const val REPLY_TAG = "reply_target"
 private const val URL_TAG = "external_url"
@@ -23,6 +27,39 @@ private val replyRegex = Regex(">>(\\d+)")
 private val urlRegex = Regex("""(?i)\bhttps?://[A-Za-z0-9./?&_#%:=+\-~;,]+""")
 private val hrefThreadRegex = Regex("/[^/]+/res/(\\d+)\\.html", RegexOption.IGNORE_CASE)
 private val anchorRegex = Regex("""(?is)<a[^>]*href=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>""")
+
+private data class HtmlCacheKey(
+    val html: String,
+    val quoteColor: Color,
+    val replyColor: Color,
+    val linkColor: Color
+)
+
+private data class HtmlCacheEntry(val text: AnnotatedString, val weight: Int)
+
+private object ParsedHtmlCache {
+    private const val MAX_ENTRIES = 128
+    private const val MAX_WEIGHT = 350_000
+    private val entries = LinkedHashMap<HtmlCacheKey, HtmlCacheEntry>(16, 0.75f, true)
+    private var currentWeight = 0
+
+    @Synchronized
+    fun get(key: HtmlCacheKey): AnnotatedString? = entries[key]?.text
+
+    @Synchronized
+    fun put(key: HtmlCacheKey, text: AnnotatedString) {
+        val weight = key.html.length + text.length * 2
+        if (weight > MAX_WEIGHT) return
+        entries.put(key, HtmlCacheEntry(text, weight))?.let { currentWeight -= it.weight }
+        currentWeight += weight
+        while (entries.size > MAX_ENTRIES || currentWeight > MAX_WEIGHT) {
+            val eldest = entries.entries.iterator()
+            if (!eldest.hasNext()) break
+            currentWeight -= eldest.next().value.weight
+            eldest.remove()
+        }
+    }
+}
 
 @Composable
 fun HtmlText(
@@ -36,8 +73,15 @@ fun HtmlText(
     onReplyClick: ((postNo: Long, threadNoHint: Long?) -> Unit)? = null,
     onLinkClick: ((url: String) -> Unit)? = null
 ) {
-    val annotated = remember(html, quoteColor, replyColor, linkColor) {
-        rememberHtmlAnnotatedString(html, quoteColor, replyColor, linkColor)
+    val annotated by produceState(
+        initialValue = AnnotatedString(""),
+        key1 = html,
+        key2 = quoteColor,
+        key3 = replyColor to linkColor
+    ) {
+        value = withContext(Dispatchers.Default) {
+            rememberHtmlAnnotatedString(html, quoteColor, replyColor, linkColor)
+        }
     }
 
     ClickableText(
@@ -81,6 +125,9 @@ fun rememberHtmlAnnotatedString(
     replyColor: Color,
     linkColor: Color
 ): AnnotatedString {
+    val cacheKey = HtmlCacheKey(html, quoteColor, replyColor, linkColor)
+    ParsedHtmlCache.get(cacheKey)?.let { return it }
+
     val threadHints = buildThreadHintQueues(html)
     val spanned = Html.fromHtml(html, Html.FROM_HTML_MODE_COMPACT)
     val plain = spanned
@@ -173,7 +220,7 @@ fun rememberHtmlAnnotatedString(
         }
     }
 
-    return builder.toAnnotatedString()
+    return builder.toAnnotatedString().also { ParsedHtmlCache.put(cacheKey, it) }
 }
 
 private fun buildThreadHintQueues(html: String): MutableMap<Long, ArrayDeque<Long?>> {

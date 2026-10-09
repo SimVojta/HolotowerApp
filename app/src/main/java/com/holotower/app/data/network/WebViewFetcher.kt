@@ -14,10 +14,17 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import com.holotower.app.data.model.CatalogPage
 import com.holotower.app.data.model.ThreadResponse
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.Request
+import okhttp3.Response
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
@@ -59,6 +66,82 @@ object WebViewFetcher {
     private val idCounter = AtomicInteger(0)
     private const val MAX_CHALLENGE_HOPS = 5
     private val fetchMutex = Mutex()
+
+    private suspend fun fetchBoardJson(url: String): String {
+        return try {
+            fetchJsonDirect(url)
+        } catch (directError: Exception) {
+            if (directError !is IOException ||
+                directError.message?.contains("cloudflare", ignoreCase = true) != true
+            ) {
+                throw directError
+            }
+
+            // Some Cloudflare checks reject non-browser HTTP clients even after
+            // clearance is available. Retry through the shared browser session.
+            try {
+                fetchJson(url)
+            } catch (browserError: Exception) {
+                if (browserError is kotlinx.coroutines.CancellationException) throw browserError
+                throw IOException(
+                    "Cloudflare security check required. Open the Cloudflare check and retry.",
+                    browserError
+                )
+            }
+        }
+    }
+
+    suspend fun fetchThreadJson(board: String, threadNo: Long): String =
+        fetchBoardJson("https://holotower.org/$board/res/$threadNo.json")
+
+    /** Fetches JSON directly; Cloudflare failures are returned to the UI for interactive handling. */
+    suspend fun fetchJsonDirect(url: String): String = suspendCancellableCoroutine { continuation ->
+        val request = Request.Builder()
+            .url(url)
+            .header("Accept", "application/json, text/javascript, */*; q=0.01")
+            .header("Referer", inferReferer(url))
+            .get()
+            .build()
+
+        val call = RetrofitClient.okHttpClient.newCall(request)
+        continuation.invokeOnCancellation { call.cancel() }
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, error: IOException) {
+                if (continuation.isActive) continuation.resumeWithException(error)
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    try {
+                        val body = response.body?.string().orEmpty()
+                        val isCloudflareChallenge = response.header("cf-mitigated")
+                            ?.equals("challenge", ignoreCase = true) == true
+                        if (isCloudflareChallenge) {
+                            throw IOException("Cloudflare security check required. Open the Cloudflare check and retry.")
+                        }
+                        if (!response.isSuccessful) {
+                            if (looksLikeCloudflareChallenge(body) ||
+                                response.code in setOf(403, 429, 503) && response.header("cf-ray") != null
+                            ) {
+                                throw IOException("Cloudflare security check required. Open the Cloudflare check and retry.")
+                            }
+                            throw IOException("Board data request failed (HTTP ${response.code}).")
+                        }
+                        val json = body.trim()
+                        if (looksLikeCloudflareChallenge(json)) {
+                            throw IOException("Cloudflare security check required. Open the Cloudflare check and retry.")
+                        }
+                        if (!json.startsWith("[") && !json.startsWith("{")) {
+                            throw IOException("The server returned an unexpected response instead of JSON.")
+                        }
+                        if (continuation.isActive) continuation.resume(json)
+                    } catch (error: Exception) {
+                        if (continuation.isActive) continuation.resumeWithException(error)
+                    }
+                }
+            }
+        })
+    }
 
     suspend fun fetchJson(url: String): String {
         return fetchMutex.withLock {
@@ -184,6 +267,16 @@ object WebViewFetcher {
                                         Log.i(TAG, "[id=$id] Valid JSON at hop=$hopCount (${trimmed.length} chars) - delivering")
                                         delivered = true
                                         restoreAndDeliver(view, id, trimmed, restoreUrl)
+                                    }
+                                    looksLikeCloudflareChallenge(trimmed) -> {
+                                        Log.w(TAG, "[id=$id] Cloudflare challenge required at hop=$hopCount; returning control to the app")
+                                        delivered = true
+                                        restoreAndDeliver(
+                                            view,
+                                            id,
+                                            "ERR: Cloudflare security check required. Open the Cloudflare check and retry.",
+                                            restoreUrl
+                                        )
                                     }
                                     trimmed.isEmpty() -> {
                                         Log.w(TAG, "[id=$id] Empty content at hop=$hopCount url=$navUrl - waiting")
@@ -424,13 +517,23 @@ object WebViewFetcher {
         }.getOrDefault("https://holotower.org/hlgg/")
     }
 
+    private fun looksLikeCloudflareChallenge(text: String): Boolean {
+        val lower = text.lowercase()
+        return lower.contains("just a moment") ||
+            lower.contains("cloudflare is verifying your request") ||
+            lower.contains("enable javascript and cookies to continue") ||
+            lower.contains("checking your browser before accessing") ||
+            lower.contains("attention required! | cloudflare") ||
+            lower.contains("ray id:")
+    }
+
     suspend fun getCatalog(board: String): List<CatalogPage> {
         val url = "https://holotower.org/$board/catalog.json"
         Log.i(TAG, "getCatalog: $url")
-        val json = fetchJson(url)
+        val json = fetchBoardJson(url)
         Log.i(TAG, "getCatalog: parsing ${json.length} chars")
         val type = object : TypeToken<List<CatalogPage>>() {}.type
-        val result = gson.fromJson<List<CatalogPage>>(json, type)
+        val result = withContext(Dispatchers.Default) { gson.fromJson<List<CatalogPage>>(json, type) }
         Log.i(TAG, "getCatalog: ${result.size} pages, ${result.sumOf { it.threads.size }} threads")
         return result
     }
@@ -438,9 +541,9 @@ object WebViewFetcher {
     suspend fun getThread(board: String, threadNo: Long): ThreadResponse {
         val url = "https://holotower.org/$board/res/$threadNo.json"
         Log.i(TAG, "getThread: $url")
-        val json = fetchJson(url)
+        val json = fetchBoardJson(url)
         Log.i(TAG, "getThread: parsing ${json.length} chars")
-        val result = gson.fromJson(json, ThreadResponse::class.java)
+        val result = withContext(Dispatchers.Default) { gson.fromJson(json, ThreadResponse::class.java) }
         Log.i(TAG, "getThread: ${result.posts.size} posts")
         return result
     }

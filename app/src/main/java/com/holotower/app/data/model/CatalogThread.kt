@@ -34,11 +34,18 @@ data class CatalogThread(
     @SerializedName("filename")       val filename: String?,
     @SerializedName("md5")            val md5: String?,
     @SerializedName("resto")          val resto: Long,
-    @SerializedName("spoiler")        val spoiler: Int?
+    @SerializedName("spoiler")        val spoiler: Int?,
+    @SerializedName("last_replies")   val lastReplies: List<Post>?
 ) {
     val isSticky get() = sticky == 1
     val isLocked get() = locked == 1
     val isMod    get() = capcode != null
+    val replyCount: Int
+        get() = replies.takeIf { it > 0 }
+            ?: (omittedPosts + lastReplies.orEmpty().size).coerceAtLeast(0)
+    val imageReplyCount: Int
+        get() = images.takeIf { it > 0 }
+            ?: (omittedImages + lastReplies.orEmpty().count { it.tim != null }).coerceAtLeast(0)
 
     fun thumbnailUrls(board: String): List<String> {
         val t = tim ?: return emptyList()

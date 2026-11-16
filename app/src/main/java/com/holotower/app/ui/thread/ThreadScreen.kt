@@ -71,6 +71,7 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -183,8 +184,17 @@ private sealed interface MiniThreadUiState {
     data class Error(val message: String) : MiniThreadUiState
 }
 
+private const val VIDEO_CONTROLS_TIMEOUT_MS = 3_000
+
+/** [onControlsVisibilityChange] reports when the player's own controls appear or hide. */
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
-private fun WebmPlayer(url: String, modifier: Modifier = Modifier) {
+private fun WebmPlayer(
+    url: String,
+    modifier: Modifier = Modifier,
+    onControlsVisibilityChange: (Boolean) -> Unit = {}
+) {
+    val currentOnControlsVisibilityChange by rememberUpdatedState(onControlsVisibilityChange)
     val context = LocalContext.current
     val cookieHeader = remember(url) { CookieManager.getInstance().getCookie(url).orEmpty() }
     val referer = remember(url) { inferReferer(url) }
@@ -222,6 +232,12 @@ private fun WebmPlayer(url: String, modifier: Modifier = Modifier) {
             PlayerView(ctx).apply {
                 setBackgroundColor(android.graphics.Color.BLACK)
                 useController = true
+                controllerShowTimeoutMs = VIDEO_CONTROLS_TIMEOUT_MS
+                setControllerVisibilityListener(
+                    PlayerView.ControllerVisibilityListener { visibility ->
+                        currentOnControlsVisibilityChange(visibility == android.view.View.VISIBLE)
+                    }
+                )
                 this.player = player
             }
         },
@@ -735,6 +751,8 @@ fun ThreadScreen(
     var showGalleryList by remember { mutableStateOf(false) }
     var mediaOpenedFromGallery by remember(threadNo) { mutableStateOf(false) }
     var galleryScrollTargetPostNo by remember { mutableStateOf<Long?>(null) }
+    // Lives outside the gallery overlay so its scroll position survives opening an image.
+    val galleryListState = remember(threadNo) { LazyListState() }
     var replyComposerTargetNo by remember { mutableStateOf<Long?>(null) }
     val mediaOverlayOpen = selectedMediaIndex in mediaItems.indices
     val anyOverlayOpen = selectedMiniThread != null || showGalleryList || mediaOverlayOpen || replyComposerTargetNo != null
@@ -1387,12 +1405,20 @@ fun ThreadScreen(
 
     if (showGalleryList) {
         var swipeX by remember { mutableFloatStateOf(0f) }
-        val galleryListState = rememberLazyListState()
         LaunchedEffect(galleryScrollTargetPostNo, galleryMediaItems) {
             val targetPostNo = galleryScrollTargetPostNo ?: return@LaunchedEffect
-            val targetIndex = galleryMediaItems.indexOfFirst { it.postNo == targetPostNo }
-            if (targetIndex >= 0) galleryListState.scrollToItem(targetIndex)
             galleryScrollTargetPostNo = null
+            val targetIndex = galleryMediaItems.indexOfFirst { it.postNo == targetPostNo }
+            if (targetIndex < 0) return@LaunchedEffect
+            // Keep the exact position the gallery had; only scroll when the item shown last
+            // (e.g. after flipping to other media in the viewer) is off screen.
+            val info = galleryListState.layoutInfo
+            val fullyVisible = info.visibleItemsInfo.any { item ->
+                item.index == targetIndex &&
+                    item.offset >= info.viewportStartOffset &&
+                    item.offset + item.size <= info.viewportEndOffset
+            }
+            if (!fullyVisible) galleryListState.scrollToItem(targetIndex)
         }
         BackHandler { showGalleryList = false }
         Box(
@@ -1567,6 +1593,7 @@ fun ThreadScreen(
             var swipeX by remember(currentMedia.url) { mutableFloatStateOf(0f) }
             var swipeY by remember(currentMedia.url) { mutableFloatStateOf(0f) }
             var swipeAxis by remember(currentMedia.url) { mutableStateOf(SwipeAxis.Undecided) }
+            var videoControlsVisible by remember(currentMedia.url) { mutableStateOf(false) }
 
             BackHandler { closeMediaViewer() }
             Box(
@@ -1693,7 +1720,11 @@ fun ThreadScreen(
                         }
                 ) {
                     if (currentMedia.kind == MediaKind.Video) {
-                        WebmPlayer(url = currentMedia.url, modifier = Modifier.fillMaxSize())
+                        WebmPlayer(
+                            url = currentMedia.url,
+                            modifier = Modifier.fillMaxSize(),
+                            onControlsVisibilityChange = { videoControlsVisible = it }
+                        )
                     } else {
                         var fullImageLoaded by remember(currentMedia.url) { mutableStateOf(false) }
                         Box(
@@ -1737,7 +1768,11 @@ fun ThreadScreen(
                     }
                 }
 
-                if (currentIndex > 0) {
+                // While the video's own controls are up, our buttons step aside (and come
+                // back when the player hides its controls after a few seconds).
+                val showViewerButtons = currentMedia.kind != MediaKind.Video || !videoControlsVisible
+
+                if (showViewerButtons && currentIndex > 0) {
                     IconButton(
                         onClick = { currentIndex -= 1 },
                         modifier = Modifier
@@ -1755,7 +1790,7 @@ fun ThreadScreen(
                     }
                 }
 
-                if (currentIndex < mediaItems.lastIndex) {
+                if (showViewerButtons && currentIndex < mediaItems.lastIndex) {
                     IconButton(
                         onClick = { currentIndex += 1 },
                         modifier = Modifier
@@ -1773,7 +1808,7 @@ fun ThreadScreen(
                     }
                 }
 
-                FlowRow(
+                if (showViewerButtons) FlowRow(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()

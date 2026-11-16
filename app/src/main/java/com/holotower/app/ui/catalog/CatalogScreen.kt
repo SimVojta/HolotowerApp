@@ -93,7 +93,7 @@ fun CatalogScreen(
     onThreadClick: (Long) -> Unit,
     onNewThreadSwipe: () -> Unit = {},
     onGlobalEntryClick: () -> Unit = {},
-    refreshAfterCloudflareToken: Long = 0L,
+    isCurrentDestination: Boolean = true,
     onRefreshCloudflare: (() -> Unit)? = null,
     vm: CatalogViewModel = viewModel()
 ) {
@@ -184,13 +184,12 @@ fun CatalogScreen(
         }
     }
 
-    LaunchedEffect(board) {
-        vm.load(boardName = board)
-    }
-    LaunchedEffect(board, refreshAfterCloudflareToken) {
-        if (refreshAfterCloudflareToken != 0L) {
-            delay(350)
-            vm.load(boardName = board, forceRefresh = true, retryOnFailure = true)
+    LaunchedEffect(board, isCurrentDestination) {
+        if (isCurrentDestination) {
+            // Reuse a recent catalog response after returning from a thread.
+            // CatalogViewModel refreshes automatically only after its short TTL;
+            // pull-to-refresh still forces an immediate fetch.
+            vm.load(boardName = board, retryOnFailure = true)
         }
     }
 

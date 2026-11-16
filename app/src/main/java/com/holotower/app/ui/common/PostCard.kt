@@ -51,6 +51,8 @@ fun PostCard(
         shape = RoundedCornerShape(4.dp)
     ) {
         Column(modifier = Modifier.padding(8.dp)) {
+            val formattedTime = remember(post.time) { post.formattedTime() }
+            val fileMeta = remember(post.ext, post.fsize) { buildFileMeta(post) }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = post.name ?: "Anonymous",
@@ -61,7 +63,7 @@ fun PostCard(
                 Spacer(modifier = Modifier.width(8.dp))
 
                 Text(
-                    text = post.formattedTime(),
+                    text = formattedTime,
                     color = Color(0xFFBDBDBD),
                     fontSize = 12.sp
                 )
@@ -75,7 +77,6 @@ fun PostCard(
                 )
             }
 
-            val fileMeta = buildFileMeta(post)
             if (fileMeta != null) {
                 Spacer(modifier = Modifier.height(2.dp))
                 Text(
@@ -99,12 +100,12 @@ fun PostCard(
             Spacer(modifier = Modifier.height(8.dp))
 
             Row(modifier = Modifier.fillMaxWidth()) {
-                val thumbUrls = post.thumbnailUrls(board)
+                val thumbUrls = remember(post.tim, post.ext, board) { post.thumbnailUrls(board) }
                 var thumbIndex by remember(post.no, board) { mutableStateOf(0) }
                 var thumbExhausted by remember(post.no, board) { mutableStateOf(false) }
                 val thumbUrl = thumbUrls.getOrNull(thumbIndex)
-                val fullImageUrl = post.fullImageUrl(board)
-                val suggestedName = suggestImageFileName(post)
+                val fullImageUrl = remember(post.tim, post.ext, board) { post.fullImageUrl(board) }
+                val suggestedName = remember(post.filename, post.tim, post.ext) { suggestImageFileName(post) }
 
                 if (thumbUrl != null && !thumbExhausted) {
                     AsyncImage(

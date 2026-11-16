@@ -411,9 +411,15 @@ private fun buildBacklinks(posts: List<Post>): Map<Long, List<Long>> {
 
 private fun extractReplyTargets(rawHtml: String?): List<Long> {
     if (rawHtml.isNullOrBlank()) return emptyList()
-    val plain = Html.fromHtml(rawHtml, Html.FROM_HTML_MODE_COMPACT).toString()
-    return replyRegex.findAll(plain).mapNotNull { it.groupValues[1].toLongOrNull() }.toList()
+    // Thread comments encode quote markers as either literal >> or &gt;&gt;.
+    // Matching the raw markup avoids running Html.fromHtml across every post
+    // whenever the thread's backlinks are rebuilt.
+    return replyMarkupRegex.findAll(rawHtml)
+        .mapNotNull { it.groupValues[1].toLongOrNull() }
+        .toList()
 }
+
+private val replyMarkupRegex = Regex("(?:&gt;|>){2}(\\d+)", RegexOption.IGNORE_CASE)
 
 private fun suggestMediaFileName(post: Post): String {
     val base = (post.filename?.trim().takeUnless { it.isNullOrBlank() } ?: post.tim ?: "media")
@@ -566,7 +572,8 @@ private fun HorizontalSwipeLayer(
                         val elapsed = if (dragStartedAtMs == 0L) Long.MAX_VALUE else {
                             (System.currentTimeMillis() - dragStartedAtMs).coerceAtLeast(0L)
                         }
-                        val fastSwipe = elapsed <= QUICK_SWIPE_MAX_DURATION_MS && absX >= QUICK_SWIPE_MIN_DISTANCE
+                        val fastSwipe = elapsed <= QUICK_SWIPE_MAX_DURATION_MS &&
+                            absX >= QUICK_SWIPE_MIN_DISTANCE
                         if (direction != 0 && (absX >= threshold || fastSwipe)) {
                             onCommit(direction)
                         }
@@ -640,6 +647,7 @@ fun ThreadScreen(
     onBack: () -> Unit,
     onOpenThread: (Long) -> Unit = {},
     onRefreshCloudflare: (() -> Unit)? = null,
+    onThreadCountsUpdated: (replies: Int, images: Int) -> Unit = { _, _ -> },
     isCurrentDestination: Boolean = true,
     vm: ThreadViewModel = viewModel(factory = ThreadViewModel.Factory(board, threadNo))
 ) {
@@ -654,6 +662,13 @@ fun ThreadScreen(
     var cachedPosts by remember { mutableStateOf<List<Post>>(emptyList()) }
     LaunchedEffect(successPosts) { if (successPosts != null) cachedPosts = successPosts }
     val allPosts = successPosts ?: cachedPosts
+    LaunchedEffect(board, threadNo, successPosts) {
+        val posts = successPosts ?: return@LaunchedEffect
+        onThreadCountsUpdated(
+            (posts.size - 1).coerceAtLeast(0),
+            posts.drop(1).count { !it.tim.isNullOrBlank() }
+        )
+    }
     val mediaItems = remember(allPosts, board) { buildMediaItems(allPosts, board) }
     var galleryFilter by remember { mutableStateOf(GalleryFilter.All) }
     val galleryMediaItems = remember(mediaItems, galleryFilter) {
@@ -685,6 +700,7 @@ fun ThreadScreen(
     var selectedMiniThread by remember { mutableStateOf<MiniThreadSelection?>(null) }
     var miniThreadUiState by remember { mutableStateOf<MiniThreadUiState>(MiniThreadUiState.Idle) }
     var showGalleryList by remember { mutableStateOf(false) }
+    var mediaOpenedFromGallery by remember(threadNo) { mutableStateOf(false) }
     var galleryScrollTargetPostNo by remember { mutableStateOf<Long?>(null) }
     var replyComposerTargetNo by remember { mutableStateOf<Long?>(null) }
     val mediaOverlayOpen = selectedMediaIndex in mediaItems.indices
@@ -708,6 +724,7 @@ fun ThreadScreen(
             releasedForBackStack = true
             cachedPosts = emptyList()
             selectedMediaIndex = -1
+            mediaOpenedFromGallery = false
             showGalleryList = false
             pendingSave = null
             selectedMiniThread = null
@@ -744,7 +761,9 @@ fun ThreadScreen(
         if (saved != null) {
             val restoredIndex = allPosts.indexOfFirst { it.no == saved.postNo }
                 .takeIf { it >= 0 }
-                ?: saved.index.coerceIn(0, allPosts.lastIndex.coerceAtLeast(0))
+                ?: allPosts.indexOfFirst { it.no > saved.postNo }
+                    .takeIf { it >= 0 }
+                ?: allPosts.lastIndex
             listState.scrollToItem(restoredIndex, saved.offset.coerceAtLeast(0))
         }
         hasRestoredScroll = true
@@ -886,7 +905,10 @@ fun ThreadScreen(
                     },
                     onImageClick = { postNo, _, _ ->
                         val idx = mediaItems.indexOfFirst { it.postNo == postNo }
-                        if (idx >= 0) selectedMediaIndex = idx
+                        if (idx >= 0) {
+                            mediaOpenedFromGallery = false
+                            selectedMediaIndex = idx
+                        }
                     },
                     onExternalLinkClick = openExternalLink,
                     onPostNumberClick = { postNo ->
@@ -1320,6 +1342,7 @@ fun ThreadScreen(
                                                 onImageClick = { postNo, imageUrl, _ ->
                                                     val idx = mediaItems.indexOfFirst { it.postNo == postNo }
                                                     if (idx >= 0) {
+                                                        mediaOpenedFromGallery = false
                                                         selectedMediaIndex = idx
                                                     } else {
                                                         openExternalLink(imageUrl)
@@ -1468,6 +1491,7 @@ fun ThreadScreen(
                                         modifier = Modifier
                                             .size(72.dp)
                                             .clickable {
+                                                mediaOpenedFromGallery = true
                                                 selectedMediaIndex = mediaIndex
                                                 showGalleryList = false
                                             },
@@ -1497,6 +1521,7 @@ fun ThreadScreen(
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         TextButton(
                                             onClick = {
+                                                mediaOpenedFromGallery = true
                                                 selectedMediaIndex = mediaIndex
                                                 showGalleryList = false
                                             }
@@ -1544,7 +1569,16 @@ fun ThreadScreen(
 
         if (currentMedia == null) {
             selectedMediaIndex = -1
+            mediaOpenedFromGallery = false
         } else {
+            val closeMediaViewer = {
+                selectedMediaIndex = -1
+                if (mediaOpenedFromGallery) {
+                    galleryScrollTargetPostNo = currentMedia.postNo
+                    showGalleryList = true
+                }
+                mediaOpenedFromGallery = false
+            }
             var scale by remember(currentMedia.url) { mutableFloatStateOf(1f) }
             var offsetX by remember(currentMedia.url) { mutableFloatStateOf(0f) }
             var offsetY by remember(currentMedia.url) { mutableFloatStateOf(0f) }
@@ -1552,7 +1586,7 @@ fun ThreadScreen(
             var swipeY by remember(currentMedia.url) { mutableFloatStateOf(0f) }
             var swipeAxis by remember(currentMedia.url) { mutableStateOf(SwipeAxis.Undecided) }
 
-            BackHandler { selectedMediaIndex = -1 }
+            BackHandler { closeMediaViewer() }
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -1661,7 +1695,7 @@ fun ThreadScreen(
                                 if (!wasMultiTouch && swipeEnabled) {
                                     when (swipeAxis) {
                                         SwipeAxis.Horizontal -> if (swipeX > GALLERY_CLOSE_THRESHOLD) {
-                                            selectedMediaIndex = -1
+                                            closeMediaViewer()
                                         }
                                         SwipeAxis.Vertical -> if (abs(swipeY) > GALLERY_NAV_THRESHOLD) {
                                             if (swipeY < 0f && currentIndex < mediaItems.lastIndex) currentIndex += 1
@@ -1750,6 +1784,8 @@ fun ThreadScreen(
                     })
                     BottomOverlayButton(text = "Post", onClick = {
                         selectedMediaIndex = -1
+                        mediaOpenedFromGallery = false
+                        showGalleryList = false
                         jumpToPostInThread(currentMedia.postNo)
                     })
                     BottomOverlayButton(text = "Gallery", onClick = {
@@ -1762,9 +1798,10 @@ fun ThreadScreen(
                         }
                         galleryScrollTargetPostNo = currentMedia.postNo
                         selectedMediaIndex = -1
+                        mediaOpenedFromGallery = false
                         showGalleryList = true
                     })
-                    BottomOverlayButton(text = "Close", onClick = { selectedMediaIndex = -1 })
+                    BottomOverlayButton(text = "Close", onClick = { closeMediaViewer() })
                 }
             }
         }

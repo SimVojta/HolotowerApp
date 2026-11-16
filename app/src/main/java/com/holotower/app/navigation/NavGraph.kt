@@ -20,6 +20,7 @@ import com.holotower.app.ui.challenge.CloudflareScreen
 import com.holotower.app.ui.globalentry.GlobalEntryScreen
 import com.holotower.app.ui.thread.NewThreadComposerScreen
 import com.holotower.app.ui.thread.ThreadScreen
+import com.holotower.app.viewmodel.CatalogViewModel
 import com.holotower.app.viewmodel.ThreadViewModel
 
 private const val ROUTE_CLOUDFLARE = "cloudflare"
@@ -55,6 +56,7 @@ fun NavGraph(board: String = "hlgg", sharedWebView: WebView) {
         }
 
         composable(ROUTE_CATALOG) { backStackEntry ->
+            val catalogViewModel: CatalogViewModel = viewModel()
             val refreshToken by backStackEntry.savedStateHandle
                 .getStateFlow(RESULT_FORCE_REFRESH_AFTER_CLOUDFLARE, 0L)
                 .collectAsState()
@@ -65,7 +67,8 @@ fun NavGraph(board: String = "hlgg", sharedWebView: WebView) {
             }
             CatalogScreen(
                 board = board,
-                refreshAfterCloudflareToken = refreshToken,
+                vm = catalogViewModel,
+                isCurrentDestination = currentBackStackEntry?.destination?.route == ROUTE_CATALOG,
                 onThreadClick = { threadNo ->
                     navController.navigate("thread/$threadNo")
                 },
@@ -102,6 +105,10 @@ fun NavGraph(board: String = "hlgg", sharedWebView: WebView) {
         ) { backStackEntry ->
             val threadNo = backStackEntry.arguments?.getLong("threadNo") ?: 0L
             val context = LocalContext.current
+            val catalogBackStackEntry = remember(navController) {
+                navController.getBackStackEntry(ROUTE_CATALOG)
+            }
+            val catalogViewModel: CatalogViewModel = viewModel(catalogBackStackEntry)
             val threadRepo = remember(context.applicationContext, board, threadNo) {
                 BoardRepository(context.applicationContext)
             }
@@ -124,6 +131,9 @@ fun NavGraph(board: String = "hlgg", sharedWebView: WebView) {
                 vm = threadViewModel,
                 isCurrentDestination = isCurrentDestination,
                 refreshAfterCloudflareToken = refreshToken,
+                onThreadCountsUpdated = { replies, images ->
+                    catalogViewModel.updateThreadCounts(board, threadNo, replies, images)
+                },
                 onBack = { navController.popBackStack() },
                 onOpenThread = { targetThreadNo ->
                     navController.navigate("thread/$targetThreadNo") {

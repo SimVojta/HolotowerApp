@@ -8,6 +8,7 @@ import androidx.compose.material3.LocalTextStyle
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
@@ -73,14 +74,23 @@ fun HtmlText(
     onReplyClick: ((postNo: Long, threadNoHint: Long?) -> Unit)? = null,
     onLinkClick: ((url: String) -> Unit)? = null
 ) {
+    // A post that has already been visited should render its text on the first
+    // frame when LazyColumn composes it again. Showing an empty string until the
+    // background parser finishes changes the row height and can move the scroll
+    // anchor while the reader is moving quickly through the thread.
+    val cachedAnnotated = remember(html, quoteColor, replyColor, linkColor) {
+        getCachedHtmlAnnotatedString(html, quoteColor, replyColor, linkColor)
+    }
     val annotated by produceState(
-        initialValue = AnnotatedString(""),
+        initialValue = cachedAnnotated ?: AnnotatedString(""),
         key1 = html,
         key2 = quoteColor,
         key3 = replyColor to linkColor
     ) {
-        value = withContext(Dispatchers.Default) {
-            rememberHtmlAnnotatedString(html, quoteColor, replyColor, linkColor)
+        if (cachedAnnotated == null) {
+            value = withContext(Dispatchers.Default) {
+                rememberHtmlAnnotatedString(html, quoteColor, replyColor, linkColor)
+            }
         }
     }
 
@@ -222,6 +232,13 @@ fun rememberHtmlAnnotatedString(
 
     return builder.toAnnotatedString().also { ParsedHtmlCache.put(cacheKey, it) }
 }
+
+private fun getCachedHtmlAnnotatedString(
+    html: String,
+    quoteColor: Color,
+    replyColor: Color,
+    linkColor: Color
+): AnnotatedString? = ParsedHtmlCache.get(HtmlCacheKey(html, quoteColor, replyColor, linkColor))
 
 private fun buildThreadHintQueues(html: String): MutableMap<Long, ArrayDeque<Long?>> {
     val result = mutableMapOf<Long, ArrayDeque<Long?>>()

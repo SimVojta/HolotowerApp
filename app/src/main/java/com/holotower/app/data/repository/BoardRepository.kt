@@ -30,20 +30,29 @@ class BoardRepository(context: Context? = null) {
         return fresh
     }
 
-    suspend fun getThreadPosts(board: String, threadNo: Long, forceRefresh: Boolean = false): List<Post> {
-        if (!forceRefresh) {
-            val cachedJson = threadDiskCache?.read(board, threadNo)
-            if (cachedJson != null) {
-                val posts = runCatching { parseThread(cachedJson) }.getOrNull()
-                if (posts != null) return posts
-                threadDiskCache.remove(board, threadNo)
+    /** The saved copy of a thread (up to 5 days old), or null. Never touches the network. */
+    suspend fun cachedThreadPosts(board: String, threadNo: Long): List<Post>? {
+        val cache = threadDiskCache ?: return null
+        val cachedJson = cache.read(board, threadNo) ?: return null
+        return runCatching { parseThread(cachedJson) }.getOrNull()
+            ?: run {
+                cache.remove(board, threadNo)
+                null
             }
-        }
+    }
 
+    /** Downloads the thread and updates the saved copy. */
+    suspend fun fetchThreadPosts(board: String, threadNo: Long): List<Post> {
         val json = WebViewFetcher.fetchThreadJson(board, threadNo)
         val fresh = parseThread(json)
         threadDiskCache?.write(board, threadNo, json)
         return fresh
+    }
+
+    /** Saved copy first, else download. Used for quoted posts from other threads. */
+    suspend fun getThreadPosts(board: String, threadNo: Long, forceRefresh: Boolean = false): List<Post> {
+        if (!forceRefresh) cachedThreadPosts(board, threadNo)?.let { return it }
+        return fetchThreadPosts(board, threadNo)
     }
 
     private suspend fun parseThread(json: String): List<Post> = withContext(Dispatchers.Default) {
@@ -94,14 +103,8 @@ class BoardRepository(context: Context? = null) {
         return parsed
     }
 
-    private suspend fun requestGlobalEntryHtml(formBody: String? = null): String = withContext(Dispatchers.IO) {
-        val url = "https://holotower.org/global-entry.php"
-        val html = WebViewFetcher.fetchHtml(url, formBody = formBody)
-        if (html.contains("Cloudflare is verifying your request", ignoreCase = true)) {
-            throw IllegalStateException("Cloudflare challenge required for Global Entry")
-        }
-        html
-    }
+    private suspend fun requestGlobalEntryHtml(formBody: String? = null): String =
+        WebViewFetcher.fetchHtml("https://holotower.org/global-entry.php", formBody = formBody)
 
     private fun buildFormBody(params: Map<String, String>): String {
         return params.entries.joinToString("&") { (key, value) ->

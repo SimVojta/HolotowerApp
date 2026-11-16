@@ -4,18 +4,21 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.holotower.app.data.model.Post
+import com.holotower.app.data.network.userMessage
 import com.holotower.app.data.repository.BoardRepository
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
+/** [posts] is whatever can be shown right now: fresh, or the previous/saved copy while loading. */
 sealed class ThreadUiState {
-    object Loading : ThreadUiState()
-    data class Success(val posts: List<Post>) : ThreadUiState()
-    data class Error(val message: String) : ThreadUiState()
+    abstract val posts: List<Post>?
+
+    data class Loading(override val posts: List<Post>? = null) : ThreadUiState()
+    data class Success(override val posts: List<Post>) : ThreadUiState()
+    data class Error(val message: String, override val posts: List<Post>? = null) : ThreadUiState()
 }
 
 class ThreadViewModel(
@@ -26,38 +29,28 @@ class ThreadViewModel(
 
     private var loadJob: Job? = null
     private var releasedForMemory = false
-    private val _state = MutableStateFlow<ThreadUiState>(ThreadUiState.Loading)
+    private val _state = MutableStateFlow<ThreadUiState>(ThreadUiState.Loading())
     val state: StateFlow<ThreadUiState> = _state
 
     init {
         load()
     }
 
-    fun load(forceRefresh: Boolean = false, retryOnFailure: Boolean = false) {
+    /** Shows the saved copy at once (if any), then always downloads the current thread. */
+    fun load(forceRefresh: Boolean = false) {
         loadJob?.cancel()
         loadJob = viewModelScope.launch {
-            _state.value = ThreadUiState.Loading
-            val firstAttempt = runCatching { repo.getThreadPosts(board, threadNo, forceRefresh = forceRefresh) }
-                .onFailure { if (it is CancellationException) throw it }
-            if (firstAttempt.isSuccess) {
-                _state.value = ThreadUiState.Success(firstAttempt.getOrThrow())
-                return@launch
+            var shown = _state.value.posts
+            if (shown == null && !forceRefresh) {
+                shown = repo.cachedThreadPosts(board, threadNo)
             }
-            if (retryOnFailure) {
-                delay(700)
-                val retryAttempt = runCatching { repo.getThreadPosts(board, threadNo, forceRefresh = true) }
-                    .onFailure { if (it is CancellationException) throw it }
-                if (retryAttempt.isSuccess) {
-                    _state.value = ThreadUiState.Success(retryAttempt.getOrThrow())
-                    return@launch
-                }
-                _state.value = ThreadUiState.Error(
-                    retryAttempt.exceptionOrNull()?.message
-                        ?: firstAttempt.exceptionOrNull()?.message
-                        ?: "Unknown error"
-                )
-            } else {
-                _state.value = ThreadUiState.Error(firstAttempt.exceptionOrNull()?.message ?: "Unknown error")
+            _state.value = ThreadUiState.Loading(shown)
+            try {
+                _state.value = ThreadUiState.Success(repo.fetchThreadPosts(board, threadNo))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.value = ThreadUiState.Error(e.userMessage("Failed to load thread"), shown)
             }
         }
     }
@@ -66,7 +59,7 @@ class ThreadViewModel(
         loadJob?.cancel()
         loadJob = null
         releasedForMemory = true
-        _state.value = ThreadUiState.Loading
+        _state.value = ThreadUiState.Loading()
     }
 
     fun reloadAfterRelease() {

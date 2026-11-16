@@ -15,7 +15,11 @@ Unofficial Android client for browsing Holotower.
   - save media
 - In-app reply/new-thread composer
 - Global Entry screen (status + attach token form)
-- Cloudflare-aware fetching flow (shared WebView session path)
+- Cloudflare handling: board data is loaded with `fetch()` inside a hidden WebView
+  that has the holotower.org origin, so it shares the browser session that passed
+  the check. When Cloudflare asks for a check, it opens on top of the app and the
+  waiting requests continue once it passes. Images and video use OkHttp (they are
+  not challenged).
 
 ## Navigation Quick Guide
 - Catalog:
@@ -26,7 +30,9 @@ Unofficial Android client for browsing Holotower.
   - Swipe left-to-right -> back to catalog
   - Swipe right-to-left -> open gallery
   - Tap >> reply to open minithreads
-  - Tap bottom refresh pill -> refresh thread
+  - Tap a post number or the pencil icon -> reply
+  - Tap bottom refresh pill, or pull down at the top -> refresh thread
+  - Tap a spoiler to reveal it
 - Minithread:
   - Swipe left-to-right -> close
 - Gallery:

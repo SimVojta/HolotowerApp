@@ -1,21 +1,15 @@
 package com.holotower.app
 
-import android.os.Bundle
-import android.util.Log
-import android.view.View
-import android.webkit.CookieManager
-import android.webkit.WebView
-import android.widget.FrameLayout
 import android.graphics.Color
+import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.core.view.WindowInsetsControllerCompat
 import coil3.ImageLoader
 import coil3.compose.setSingletonImageLoaderFactory
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
+import com.holotower.app.data.network.AppForeground
 import com.holotower.app.data.network.CloudflareHelper
-import com.holotower.app.data.network.ForegroundChallengePolicy
-import com.holotower.app.data.network.WebViewBridge
 import com.holotower.app.data.network.WebViewFetcher
 import com.holotower.app.navigation.NavGraph
 import okhttp3.Cache
@@ -23,14 +17,10 @@ import okhttp3.OkHttpClient
 import java.io.File
 import java.util.concurrent.TimeUnit
 
-private const val TAG = "MainActivity"
-
 class MainActivity : ComponentActivity() {
-    private lateinit var sharedWebView: WebView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        Log.i(TAG, "onCreate: starting")
         window.statusBarColor = Color.BLACK
         window.navigationBarColor = Color.BLACK
         WindowInsetsControllerCompat(window, window.decorView).apply {
@@ -38,38 +28,8 @@ class MainActivity : ComponentActivity() {
             isAppearanceLightNavigationBars = false
         }
 
-        sharedWebView = WebView(this).apply {
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            setBackgroundColor(Color.BLACK)
-
-            val cookieManager = CookieManager.getInstance()
-            cookieManager.setAcceptCookie(true)
-            cookieManager.setAcceptThirdPartyCookies(this, true)
-
-            CloudflareHelper.userAgent = settings.userAgentString
-            Log.i(TAG, "WebView created. UA=${CloudflareHelper.userAgent}")
-
-            addJavascriptInterface(WebViewBridge, "AndroidBridge")
-            Log.i(TAG, "AndroidBridge registered on WebView (before any page load)")
-        }
-
-        WebViewFetcher.webView = sharedWebView
-        Log.i(TAG, "WebViewFetcher.webView assigned")
-
-        // Pin the shared WebView first so challenge loads start only after attach.
-        sharedWebView.layoutParams = FrameLayout.LayoutParams(1, 1)
-        sharedWebView.visibility = View.INVISIBLE
-
-        val decorView = window.decorView as? FrameLayout
-        if (decorView == null) {
-            Log.e(TAG, "decorView is not a FrameLayout! Type=${window.decorView::class.java.name}")
-        } else if (sharedWebView.parent == null) {
-            decorView.addView(sharedWebView)
-            Log.i(TAG, "WebView pinned into decorView. isAttachedToWindow=${sharedWebView.isAttachedToWindow}")
-        } else {
-            Log.w(TAG, "WebView already has parent=${sharedWebView.parent} - skipping addView")
-        }
+        // Hidden WebView that loads all board data (see WebViewFetcher).
+        WebViewFetcher.attach(this)
 
         setContent {
             setSingletonImageLoaderFactory { context ->
@@ -79,8 +39,7 @@ class MainActivity : ComponentActivity() {
                     .addNetworkInterceptor { chain ->
                         val request = chain.request()
                         val response = chain.proceed(request)
-                        val path = request.url.encodedPath
-                        if (path.contains("/thumb/")) {
+                        if (request.url.encodedPath.contains("/thumb/") && response.isSuccessful) {
                             response.newBuilder()
                                 .removeHeader("Pragma")
                                 .header("Cache-Control", "public, max-age=604800")
@@ -100,31 +59,32 @@ class MainActivity : ComponentActivity() {
                     }
                     .build()
             }
-            NavGraph(board = "hlgg", sharedWebView = sharedWebView)
+            NavGraph(board = "hlgg")
         }
     }
 
-    override fun onPause() {
-        sharedWebView.onPause()
-        sharedWebView.pauseTimers()
-        ForegroundChallengePolicy.onAppBackgrounded()
-        super.onPause()
+    override fun onStart() {
+        super.onStart()
+        AppForeground.onStart()
     }
 
     override fun onResume() {
         super.onResume()
-        sharedWebView.onResume()
-        sharedWebView.resumeTimers()
+        WebViewFetcher.onResume()
+    }
+
+    override fun onPause() {
+        WebViewFetcher.onPause()
+        super.onPause()
+    }
+
+    override fun onStop() {
+        AppForeground.onStop()
+        super.onStop()
     }
 
     override fun onDestroy() {
+        WebViewFetcher.detach(this)
         super.onDestroy()
-        Log.i(TAG, "onDestroy: cleaning up")
-        WebViewFetcher.webView?.let { wv ->
-            (wv.parent as? FrameLayout)?.removeView(wv)
-            wv.destroy()
-            Log.i(TAG, "WebView destroyed")
-        }
-        WebViewFetcher.webView = null
     }
 }

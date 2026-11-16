@@ -1,550 +1,279 @@
 package com.holotower.app.data.network
 
-import android.graphics.Bitmap
-import android.net.Uri
+import android.app.Activity
+import android.graphics.Color
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.View
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
+import androidx.annotation.MainThread
 import com.google.gson.Gson
+import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
 import com.holotower.app.data.model.CatalogPage
 import com.holotower.app.data.model.ThreadResponse
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withContext
-import okhttp3.Call
-import okhttp3.Callback
-import okhttp3.Request
-import okhttp3.Response
-import java.io.IOException
+import kotlinx.coroutines.withTimeoutOrNull
+import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 private const val TAG = "WebViewFetcher"
-private val mainHandler = Handler(Looper.getMainLooper())
+private const val ORIGIN = "https://holotower.org/"
+private const val FETCH_TIMEOUT_MS = 45_000L
+private const val MAX_CHALLENGE_ROUNDS = 2
+private const val MAX_ATTEMPTS = 4
+private const val ACCEPT_JSON = "application/json, text/javascript, */*; q=0.01"
+private const val ACCEPT_HTML = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 
+/** Result of one fetch() made inside the hidden WebView. */
+private data class FetchEnvelope(
+    @SerializedName("s") val status: Int = 0,
+    @SerializedName("cf") val cfMitigated: String? = null,
+    @SerializedName("b") val body: String? = null,
+    @SerializedName("e") val error: String? = null
+)
+
+private val gson = Gson()
+
+/** Receives fetch() results from JavaScript. Methods run on the WebView's JavaBridge thread. */
 object WebViewBridge {
     private val callbacks = ConcurrentHashMap<Int, (String) -> Unit>()
+    private val interruptedPayload = gson.toJson(FetchEnvelope(status = -1, error = "interrupted"))
 
     fun register(id: Int, callback: (String) -> Unit) {
         callbacks[id] = callback
-        Log.d(TAG, "[Bridge] Registered id=$id. Pending=${callbacks.size}")
     }
 
     fun unregister(id: Int) {
-        val removed = callbacks.remove(id)
-        Log.d(TAG, "[Bridge] Unregistered id=$id (existed=${removed != null}). Pending=${callbacks.size}")
+        callbacks.remove(id)
+    }
+
+    /** Resolves every waiting request as interrupted (the WebView went away). */
+    fun failAll() {
+        callbacks.keys.toList().forEach { id -> callbacks.remove(id)?.invoke(interruptedPayload) }
     }
 
     @JavascriptInterface
     fun onResult(id: Int, data: String) {
-        Log.d(TAG, "[Bridge] onResult: id=$id length=${data.length} isErr=${data.startsWith("ERR:")}")
-        if (data.length <= 300) Log.v(TAG, "[Bridge] data: $data")
-        else Log.v(TAG, "[Bridge] preview: ${data.take(300)}...")
-        val cb = callbacks.remove(id)
-        if (cb == null) {
-            Log.w(TAG, "[Bridge] No callback for id=$id (cancelled?)")
-            return
-        }
-        cb(data)
+        callbacks.remove(id)?.invoke(data)
     }
 }
 
+/**
+ * Loads site data with fetch() from inside a hidden WebView whose page has the
+ * holotower.org origin. Requests therefore go out with the same browser, cookies and
+ * TLS fingerprint that passed the Cloudflare check, and several can run at once.
+ * Plain OkHttp is still used for images and video, which Cloudflare does not challenge.
+ */
 object WebViewFetcher {
-    var webView: WebView? = null
-    private val gson = Gson()
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val idCounter = AtomicInteger(0)
-    private const val MAX_CHALLENGE_HOPS = 5
-    private val fetchMutex = Mutex()
 
-    private suspend fun fetchBoardJson(url: String): String {
-        return try {
-            fetchJsonDirect(url)
-        } catch (directError: Exception) {
-            if (directError !is IOException ||
-                directError.message?.contains("cloudflare", ignoreCase = true) != true
-            ) {
-                throw directError
+    /** The hidden WebView once its holotower.org page has loaded; null while (re)creating. */
+    private val readyView = MutableStateFlow<WebView?>(null)
+    private var webView: WebView? = null
+    private var activityRef: WeakReference<Activity>? = null
+
+    @MainThread
+    fun attach(activity: Activity) {
+        destroyWebView()
+        activityRef = WeakReference(activity)
+        val decorView = activity.window.decorView as? FrameLayout ?: run {
+            Log.e(TAG, "decorView is not a FrameLayout; data requests cannot start")
+            return
+        }
+
+        val wv = WebView(activity).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            setBackgroundColor(Color.BLACK)
+            // Kept attached (1x1, invisible) so the renderer keeps running JavaScript.
+            layoutParams = FrameLayout.LayoutParams(1, 1)
+            visibility = View.INVISIBLE
+            isFocusable = false
+            addJavascriptInterface(WebViewBridge, "AndroidBridge")
+        }
+        CookieManager.getInstance().apply {
+            setAcceptCookie(true)
+            setAcceptThirdPartyCookies(wv, true)
+        }
+        CloudflareHelper.userAgent = wv.settings.userAgentString
+
+        wv.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String?) {
+                if (webView === view) {
+                    Log.i(TAG, "Fetch page ready ($url)")
+                    readyView.value = view
+                }
             }
 
-            // Some Cloudflare checks reject non-browser HTTP clients even after
-            // clearance is available. Retry through the shared browser session.
-            try {
-                fetchJson(url)
-            } catch (browserError: Exception) {
-                if (browserError is kotlinx.coroutines.CancellationException) throw browserError
-                throw IOException(
-                    "Cloudflare security check required. Open the Cloudflare check and retry.",
-                    browserError
-                )
+            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail?): Boolean {
+                Log.w(TAG, "Fetch WebView renderer gone (crash=${detail?.didCrash()}); recreating")
+                if (webView === view) {
+                    mainHandler.post { activityRef?.get()?.let(::attach) ?: destroyWebView() }
+                }
+                return true
             }
+        }
+
+        webView = wv
+        decorView.addView(wv)
+        // A local page that counts as https://holotower.org/ for the same-origin policy,
+        // without a network request of its own.
+        wv.loadDataWithBaseURL(ORIGIN, "<!doctype html><title>HoloTower</title>", "text/html", "utf-8", null)
+    }
+
+    @MainThread
+    fun detach(activity: Activity) {
+        if (activityRef?.get() === activity) {
+            destroyWebView()
+            activityRef = null
         }
     }
 
-    suspend fun fetchThreadJson(board: String, threadNo: Long): String =
-        fetchBoardJson("https://holotower.org/$board/res/$threadNo.json")
-
-    /** Fetches JSON directly; Cloudflare failures are returned to the UI for interactive handling. */
-    suspend fun fetchJsonDirect(url: String): String = suspendCancellableCoroutine { continuation ->
-        val request = Request.Builder()
-            .url(url)
-            .header("Accept", "application/json, text/javascript, */*; q=0.01")
-            .header("Referer", inferReferer(url))
-            .get()
-            .build()
-
-        val call = RetrofitClient.okHttpClient.newCall(request)
-        continuation.invokeOnCancellation { call.cancel() }
-        call.enqueue(object : Callback {
-            override fun onFailure(call: Call, error: IOException) {
-                if (continuation.isActive) continuation.resumeWithException(error)
-            }
-
-            override fun onResponse(call: Call, response: Response) {
-                response.use {
-                    try {
-                        val body = response.body?.string().orEmpty()
-                        val isCloudflareChallenge = response.header("cf-mitigated")
-                            ?.equals("challenge", ignoreCase = true) == true
-                        if (isCloudflareChallenge) {
-                            throw IOException("Cloudflare security check required. Open the Cloudflare check and retry.")
-                        }
-                        if (!response.isSuccessful) {
-                            if (looksLikeCloudflareChallenge(body) ||
-                                response.code in setOf(403, 429, 503) && response.header("cf-ray") != null
-                            ) {
-                                throw IOException("Cloudflare security check required. Open the Cloudflare check and retry.")
-                            }
-                            throw IOException("Board data request failed (HTTP ${response.code}).")
-                        }
-                        val json = body.trim()
-                        if (looksLikeCloudflareChallenge(json)) {
-                            throw IOException("Cloudflare security check required. Open the Cloudflare check and retry.")
-                        }
-                        if (!json.startsWith("[") && !json.startsWith("{")) {
-                            throw IOException("The server returned an unexpected response instead of JSON.")
-                        }
-                        if (continuation.isActive) continuation.resume(json)
-                    } catch (error: Exception) {
-                        if (continuation.isActive) continuation.resumeWithException(error)
-                    }
-                }
-            }
-        })
-    }
-
-    suspend fun fetchJson(url: String): String {
-        return fetchMutex.withLock {
-            val wv = webView ?: run {
-                Log.e(TAG, "fetchJson: webView is NULL")
-                throw IllegalStateException("WebView is null")
-            }
-
-            Log.i(TAG, "fetchJson: url=$url")
-            Log.d(TAG, "fetchJson: isAttachedToWindow=${wv.isAttachedToWindow} parent=${wv.parent}")
-
-            val id = idCounter.getAndIncrement()
-
-            withTimeout(60_000) {
-                suspendCancellableCoroutine { cont ->
-                Log.i(TAG, "[id=$id] Starting nav-based fetch")
-
-                WebViewBridge.register(id) { data ->
-                    if (cont.isActive) {
-                        if (data.startsWith("ERR:")) {
-                            Log.e(TAG, "[id=$id] Exception: $data")
-                            cont.resumeWithException(Exception(data))
-                        } else {
-                            Log.i(TAG, "[id=$id] Success (${data.length} chars)")
-                            cont.resume(data)
-                        }
-                    } else {
-                        Log.w(TAG, "[id=$id] Continuation inactive - dropping")
-                    }
-                }
-
-                cont.invokeOnCancellation {
-                    Log.w(TAG, "[id=$id] Cancelled - cleaning up")
-                    WebViewBridge.unregister(id)
-                    mainHandler.post {
-                        wv.stopLoading()
-                        wv.webViewClient = WebViewClient()
-                    }
-                }
-
-                mainHandler.post {
-                    if (!wv.isAttachedToWindow) {
-                        Log.e(TAG, "[id=$id] WebView NOT attached to window!")
-                    }
-
-                    val sourceUrl = wv.url ?: "about:blank"
-                    val restoreUrl = "about:blank"
-                    val referer = if (sourceUrl == "about:blank" || sourceUrl == url) {
-                        inferReferer(url)
-                    } else {
-                        sourceUrl
-                    }
-
-                    Log.i(TAG, "[id=$id] sourceUrl=$sourceUrl restoreUrl=$restoreUrl, navigating to $url")
-
-                    val extraHeaders = mapOf(
-                        "Referer" to referer,
-                        "Accept" to "application/json, text/javascript, */*; q=0.01",
-                        "Accept-Language" to "en-US,en;q=0.9"
-                    )
-                    Log.i(TAG, "[id=$id] extraHeaders=$extraHeaders")
-
-                    var hopCount = 0
-                    var sawRequestedLoad = false
-                    var delivered = false
-
-                    wv.stopLoading()
-                    wv.webViewClient = object : WebViewClient() {
-                        override fun onPageStarted(view: WebView, navUrl: String?, favicon: Bitmap?) {
-                            if (navUrl == url) sawRequestedLoad = true
-                            Log.d(TAG, "[id=$id] onPageStarted[$hopCount]: $navUrl sawRequestedLoad=$sawRequestedLoad")
-                        }
-
-                        override fun onPageFinished(view: WebView, navUrl: String?) {
-                            Log.i(TAG, "[id=$id] onPageFinished[$hopCount]: $navUrl sawRequestedLoad=$sawRequestedLoad delivered=$delivered")
-
-                            if (delivered && (navUrl == restoreUrl || navUrl == "about:blank")) {
-                                Log.d(TAG, "[id=$id] Reached restore URL after delivery - clearing WebViewClient")
-                                view.webViewClient = WebViewClient()
-                                return
-                            }
-
-                            if (!sawRequestedLoad && (navUrl == restoreUrl || navUrl == "about:blank" || navUrl == sourceUrl)) {
-                                Log.w(TAG, "[id=$id] Ignoring stale finish before requested load starts: $navUrl")
-                                return
-                            }
-
-                            if (navUrl == restoreUrl || navUrl == "about:blank") {
-                                Log.d(TAG, "[id=$id] Ignoring restore URL before delivery")
-                                return
-                            }
-
-                            hopCount++
-
-                            if (hopCount > MAX_CHALLENGE_HOPS) {
-                                Log.e(TAG, "[id=$id] Exceeded $MAX_CHALLENGE_HOPS hops without JSON")
-                                delivered = true
-                                restoreAndDeliver(view, id, "ERR: Too many Cloudflare hops for $url", restoreUrl)
-                                return
-                            }
-
-                            view.evaluateJavascript(
-                                "(function() { return document.documentElement.innerText; })()"
-                            ) { rawResult ->
-                                Log.d(TAG, "[id=$id] innerText rawLength=${rawResult?.length} hop=$hopCount")
-
-                                val text: String? = try {
-                                    if (rawResult != null && rawResult != "null") {
-                                        gson.fromJson(rawResult, String::class.java)
-                                    } else {
-                                        null
-                                    }
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "[id=$id] innerText decode failed: ${e.message}")
-                                    null
-                                }
-
-                                val trimmed = text?.trim() ?: ""
-                                Log.v(TAG, "[id=$id] Content preview hop=$hopCount: ${trimmed.take(200)}")
-
-                                when {
-                                    trimmed.startsWith("[") || trimmed.startsWith("{") -> {
-                                        Log.i(TAG, "[id=$id] Valid JSON at hop=$hopCount (${trimmed.length} chars) - delivering")
-                                        delivered = true
-                                        restoreAndDeliver(view, id, trimmed, restoreUrl)
-                                    }
-                                    looksLikeCloudflareChallenge(trimmed) -> {
-                                        Log.w(TAG, "[id=$id] Cloudflare challenge required at hop=$hopCount; returning control to the app")
-                                        delivered = true
-                                        restoreAndDeliver(
-                                            view,
-                                            id,
-                                            "ERR: Cloudflare security check required. Open the Cloudflare check and retry.",
-                                            restoreUrl
-                                        )
-                                    }
-                                    trimmed.isEmpty() -> {
-                                        Log.w(TAG, "[id=$id] Empty content at hop=$hopCount url=$navUrl - waiting")
-                                    }
-                                    else -> {
-                                        Log.w(
-                                            TAG,
-                                            "[id=$id] Non-JSON at hop=$hopCount url=$navUrl - challenge/HTML. Full text (${trimmed.length} chars):\n$trimmed"
-                                        )
-                                        Log.w(TAG, "[id=$id] Waiting for Cloudflare to auto-solve and redirect...")
-                                    }
-                                }
-                            }
-                        }
-
-                        override fun onReceivedError(
-                            view: WebView,
-                            request: WebResourceRequest?,
-                            error: WebResourceError?
-                        ) {
-                            val errUrl = request?.url?.toString()
-                            val errCode = error?.errorCode
-                            val errDesc = error?.description
-                            Log.e(
-                                TAG,
-                                "[id=$id] onReceivedError: code=$errCode desc=$errDesc url=$errUrl mainFrame=${request?.isForMainFrame}"
-                            )
-                            if (request?.isForMainFrame == true) {
-                                delivered = true
-                                restoreAndDeliver(
-                                    view,
-                                    id,
-                                    "ERR: WebView error $errCode ($errDesc) for $errUrl",
-                                    restoreUrl
-                                )
-                            }
-                        }
-                    }
-
-                    Log.i(TAG, "[id=$id] Calling loadUrl($url) with Referer=$referer")
-                    wv.loadUrl(url, extraHeaders)
-                }
-                }
-            }
+    /** Timers are global to every WebView in the process, so this also pauses the others. */
+    @MainThread
+    fun onPause() {
+        webView?.let {
+            it.onPause()
+            it.pauseTimers()
         }
     }
 
-    suspend fun fetchHtml(url: String, formBody: String? = null): String {
-        return fetchMutex.withLock {
-            val wv = webView ?: run {
-                Log.e(TAG, "fetchHtml: webView is NULL")
-                throw IllegalStateException("WebView is null")
-            }
-
-            Log.i(TAG, "fetchHtml: url=$url method=${if (formBody == null) "GET" else "POST"}")
-            Log.d(TAG, "fetchHtml: isAttachedToWindow=${wv.isAttachedToWindow} parent=${wv.parent}")
-
-            val id = idCounter.getAndIncrement()
-
-            withTimeout(60_000) {
-                suspendCancellableCoroutine { cont ->
-                Log.i(TAG, "[id=$id] Starting nav-based HTML fetch")
-
-                WebViewBridge.register(id) { data ->
-                    if (cont.isActive) {
-                        if (data.startsWith("ERR:")) {
-                            Log.e(TAG, "[id=$id] Exception: $data")
-                            cont.resumeWithException(Exception(data))
-                        } else {
-                            Log.i(TAG, "[id=$id] Success HTML (${data.length} chars)")
-                            cont.resume(data)
-                        }
-                    } else {
-                        Log.w(TAG, "[id=$id] Continuation inactive - dropping")
-                    }
-                }
-
-                cont.invokeOnCancellation {
-                    Log.w(TAG, "[id=$id] Cancelled HTML fetch - cleaning up")
-                    WebViewBridge.unregister(id)
-                    mainHandler.post {
-                        wv.stopLoading()
-                        wv.webViewClient = WebViewClient()
-                    }
-                }
-
-                mainHandler.post {
-                    if (!wv.isAttachedToWindow) {
-                        Log.e(TAG, "[id=$id] WebView NOT attached to window!")
-                    }
-
-                    val sourceUrl = wv.url ?: "about:blank"
-                    val restoreUrl = "about:blank"
-                    val referer = if (sourceUrl == "about:blank" || sourceUrl == url) {
-                        inferReferer(url)
-                    } else {
-                        sourceUrl
-                    }
-
-                    Log.i(TAG, "[id=$id] sourceUrl=$sourceUrl restoreUrl=$restoreUrl, navigating to $url")
-
-                    val extraHeaders = mapOf(
-                        "Referer" to referer,
-                        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language" to "en-US,en;q=0.9"
-                    )
-                    Log.i(TAG, "[id=$id] extraHeaders=$extraHeaders")
-
-                    var hopCount = 0
-                    var sawRequestedLoad = false
-                    var delivered = false
-
-                    wv.stopLoading()
-                    wv.webViewClient = object : WebViewClient() {
-                        override fun onPageStarted(view: WebView, navUrl: String?, favicon: Bitmap?) {
-                            if (navUrl == url) sawRequestedLoad = true
-                            Log.d(TAG, "[id=$id] onPageStarted[$hopCount]: $navUrl sawRequestedLoad=$sawRequestedLoad")
-                        }
-
-                        override fun onPageFinished(view: WebView, navUrl: String?) {
-                            Log.i(TAG, "[id=$id] onPageFinished[$hopCount]: $navUrl sawRequestedLoad=$sawRequestedLoad delivered=$delivered")
-
-                            if (delivered && (navUrl == restoreUrl || navUrl == "about:blank")) {
-                                Log.d(TAG, "[id=$id] Reached restore URL after delivery - clearing WebViewClient")
-                                view.webViewClient = WebViewClient()
-                                return
-                            }
-
-                            if (!sawRequestedLoad && (navUrl == restoreUrl || navUrl == "about:blank" || navUrl == sourceUrl)) {
-                                Log.w(TAG, "[id=$id] Ignoring stale finish before requested load starts: $navUrl")
-                                return
-                            }
-
-                            if (navUrl == restoreUrl || navUrl == "about:blank") {
-                                Log.d(TAG, "[id=$id] Ignoring restore URL before delivery")
-                                return
-                            }
-
-                            hopCount++
-
-                            if (hopCount > MAX_CHALLENGE_HOPS) {
-                                Log.e(TAG, "[id=$id] Exceeded $MAX_CHALLENGE_HOPS hops without final HTML")
-                                delivered = true
-                                restoreAndDeliver(view, id, "ERR: Too many Cloudflare hops for $url", restoreUrl)
-                                return
-                            }
-
-                            view.evaluateJavascript(
-                                "(function(){ return [document.documentElement.outerHTML || '', document.documentElement.innerText || '']; })();"
-                            ) { rawResult ->
-                                val pair = try {
-                                    gson.fromJson(rawResult, Array<String>::class.java)
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "[id=$id] HTML decode failed: ${e.message}")
-                                    null
-                                }
-
-                                val html = pair?.getOrNull(0).orEmpty()
-                                val text = pair?.getOrNull(1).orEmpty().trim()
-
-                                val challengeActive =
-                                    text.contains("Cloudflare is verifying your request", ignoreCase = true) ||
-                                        text.contains("Just a moment", ignoreCase = true) ||
-                                        text.contains("Enable JavaScript and cookies to continue", ignoreCase = true)
-
-                                when {
-                                    html.isBlank() -> {
-                                        Log.w(TAG, "[id=$id] Empty HTML at hop=$hopCount url=$navUrl - waiting")
-                                    }
-                                    challengeActive -> {
-                                        Log.i(TAG, "[id=$id] Challenge HTML still active at hop=$hopCount - waiting")
-                                    }
-                                    else -> {
-                                        Log.i(TAG, "[id=$id] Final HTML captured at hop=$hopCount (${html.length} chars)")
-                                        delivered = true
-                                        restoreAndDeliver(view, id, html, restoreUrl)
-                                    }
-                                }
-                            }
-                        }
-
-                        override fun onReceivedError(
-                            view: WebView,
-                            request: WebResourceRequest?,
-                            error: WebResourceError?
-                        ) {
-                            val errUrl = request?.url?.toString()
-                            val errCode = error?.errorCode
-                            val errDesc = error?.description
-                            Log.e(
-                                TAG,
-                                "[id=$id] onReceivedError: code=$errCode desc=$errDesc url=$errUrl mainFrame=${request?.isForMainFrame}"
-                            )
-                            if (request?.isForMainFrame == true) {
-                                delivered = true
-                                restoreAndDeliver(
-                                    view,
-                                    id,
-                                    "ERR: WebView error $errCode ($errDesc) for $errUrl",
-                                    restoreUrl
-                                )
-                            }
-                        }
-                    }
-
-                    if (formBody == null) {
-                        Log.i(TAG, "[id=$id] Calling loadUrl($url) with Referer=$referer")
-                        wv.loadUrl(url, extraHeaders)
-                    } else {
-                        sawRequestedLoad = true
-                        Log.i(TAG, "[id=$id] Calling postUrl($url) with body length=${formBody.length}")
-                        wv.postUrl(url, formBody.toByteArray(Charsets.UTF_8))
-                    }
-                }
-                }
-            }
+    @MainThread
+    fun onResume() {
+        webView?.let {
+            it.onResume()
+            it.resumeTimers()
         }
     }
 
-    private fun restoreAndDeliver(view: WebView, id: Int, data: String, restoreUrl: String) {
-        Log.i(TAG, "[id=$id] restoreAndDeliver: data length=${data.length}, reloading restoreUrl=$restoreUrl")
-        WebViewBridge.onResult(id, data)
-        view.webViewClient = WebViewClient()
-        view.loadUrl(restoreUrl)
-    }
-
-    private fun inferReferer(url: String): String {
-        return runCatching {
-            val uri = Uri.parse(url)
-            val scheme = uri.scheme ?: "https"
-            val host = uri.host ?: "holotower.org"
-            val firstPath = uri.pathSegments.firstOrNull()
-            if (firstPath.isNullOrBlank()) {
-                "$scheme://$host/"
-            } else {
-                "$scheme://$host/$firstPath/"
-            }
-        }.getOrDefault("https://holotower.org/hlgg/")
-    }
-
-    private fun looksLikeCloudflareChallenge(text: String): Boolean {
-        val lower = text.lowercase()
-        return lower.contains("just a moment") ||
-            lower.contains("cloudflare is verifying your request") ||
-            lower.contains("enable javascript and cookies to continue") ||
-            lower.contains("checking your browser before accessing") ||
-            lower.contains("attention required! | cloudflare") ||
-            lower.contains("ray id:")
+    @MainThread
+    private fun destroyWebView() {
+        val old = webView ?: return
+        webView = null
+        readyView.value = null
+        WebViewBridge.failAll()
+        (old.parent as? FrameLayout)?.removeView(old)
+        old.destroy()
     }
 
     suspend fun getCatalog(board: String): List<CatalogPage> {
-        val url = "https://holotower.org/$board/catalog.json"
-        Log.i(TAG, "getCatalog: $url")
-        val json = fetchBoardJson(url)
-        Log.i(TAG, "getCatalog: parsing ${json.length} chars")
+        val json = fetchJson("${ORIGIN}$board/catalog.json")
         val type = object : TypeToken<List<CatalogPage>>() {}.type
-        val result = withContext(Dispatchers.Default) { gson.fromJson<List<CatalogPage>>(json, type) }
-        Log.i(TAG, "getCatalog: ${result.size} pages, ${result.sumOf { it.threads.size }} threads")
-        return result
+        return withContext(Dispatchers.Default) { gson.fromJson<List<CatalogPage>>(json, type) }
     }
 
+    suspend fun fetchThreadJson(board: String, threadNo: Long): String =
+        fetchJson("${ORIGIN}$board/res/$threadNo.json")
+
     suspend fun getThread(board: String, threadNo: Long): ThreadResponse {
-        val url = "https://holotower.org/$board/res/$threadNo.json"
-        Log.i(TAG, "getThread: $url")
-        val json = fetchBoardJson(url)
-        Log.i(TAG, "getThread: parsing ${json.length} chars")
-        val result = withContext(Dispatchers.Default) { gson.fromJson(json, ThreadResponse::class.java) }
-        Log.i(TAG, "getThread: ${result.posts.size} posts")
-        return result
+        val json = fetchThreadJson(board, threadNo)
+        return withContext(Dispatchers.Default) { gson.fromJson(json, ThreadResponse::class.java) }
+    }
+
+    suspend fun fetchJson(url: String): String {
+        val body = fetchText(url, accept = ACCEPT_JSON).trim()
+        if (!body.startsWith("[") && !body.startsWith("{")) throw FetchException.BadResponse()
+        return body
+    }
+
+    /** GET, or POST when [formBody] (x-www-form-urlencoded) is given. */
+    suspend fun fetchHtml(url: String, formBody: String? = null): String =
+        fetchText(url, formBody = formBody, accept = ACCEPT_HTML)
+
+    private suspend fun fetchText(url: String, formBody: String? = null, accept: String): String {
+        var challengeRounds = 0
+        var interruptions = 0
+        repeat(MAX_ATTEMPTS) {
+            val generationAtStart = ChallengeGate.generation
+            val result = runFetch(url, formBody, accept)
+            when {
+                result.status == -1 -> {
+                    if (++interruptions > 1) throw FetchException.Interrupted()
+                }
+                result.status == 0 -> throw FetchException.Offline(result.error)
+                result.isChallenge() -> {
+                    // A check that finished while this request was in flight: just retry.
+                    if (ChallengeGate.generation != generationAtStart) return@repeat
+                    if (++challengeRounds > MAX_CHALLENGE_ROUNDS) throw FetchException.ChallengeRequired()
+                    // The visible check opens this URL as a normal (GET) page.
+                    Log.i(TAG, "Challenge for $url; waiting for the security check")
+                    if (!ChallengeGate.awaitClearance(url)) throw FetchException.ChallengeRequired()
+                }
+                result.status in 200..299 -> return result.body.orEmpty()
+                else -> throw FetchException.Http(result.status)
+            }
+        }
+        throw FetchException.ChallengeRequired()
+    }
+
+    private suspend fun runFetch(url: String, formBody: String?, accept: String): FetchEnvelope {
+        val raw = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+            val wv = readyView.filterNotNull().first()
+            val id = idCounter.incrementAndGet()
+            suspendCancellableCoroutine<String> { cont ->
+                WebViewBridge.register(id) { data -> if (cont.isActive) cont.resume(data) }
+                cont.invokeOnCancellation { WebViewBridge.unregister(id) }
+                val script = fetchScript(id, url, formBody, accept)
+                mainHandler.post {
+                    if (webView === wv) {
+                        wv.evaluateJavascript(script, null)
+                    } else {
+                        WebViewBridge.failAll()
+                    }
+                }
+            }
+        } ?: throw FetchException.Timeout()
+        return withContext(Dispatchers.Default) {
+            runCatching { gson.fromJson(raw, FetchEnvelope::class.java) }.getOrNull()
+                ?: FetchEnvelope(status = -1)
+        }
+    }
+
+    private fun fetchScript(id: Int, url: String, formBody: String?, accept: String): String {
+        val jsUrl = gson.toJson(url)
+        val jsAccept = gson.toJson(accept)
+        val jsBody = formBody?.let(gson::toJson) ?: "null"
+        return """
+            (function() {
+              var id = $id;
+              function send(o) { try { AndroidBridge.onResult(id, JSON.stringify(o)); } catch (e) {} }
+              var body = $jsBody;
+              var opts = { method: body === null ? 'GET' : 'POST', credentials: 'include',
+                           cache: 'no-cache', redirect: 'follow', headers: { 'Accept': $jsAccept } };
+              if (body !== null) {
+                opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+                opts.body = body;
+              }
+              fetch($jsUrl, opts).then(function(r) {
+                return r.text().then(function(t) {
+                  send({ s: r.status, cf: r.headers.get('cf-mitigated') || '', b: t });
+                });
+              }).catch(function(e) {
+                send({ s: 0, e: String((e && e.message) || e) });
+              });
+            })();
+        """.trimIndent()
+    }
+
+    private fun FetchEnvelope.isChallenge(): Boolean {
+        if (cfMitigated.equals("challenge", ignoreCase = true)) return true
+        if (status != 403 && status != 503) return false
+        val head = body.orEmpty().take(6000).lowercase()
+        return "<title>just a moment" in head || "challenge-platform" in head || "_cf_chl_opt" in head
     }
 }

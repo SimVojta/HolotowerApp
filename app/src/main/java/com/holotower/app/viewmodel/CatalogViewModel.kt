@@ -3,18 +3,22 @@ package com.holotower.app.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.holotower.app.data.model.CatalogThread
+import com.holotower.app.data.network.userMessage
 import com.holotower.app.data.repository.BoardRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import java.util.LinkedHashMap
 
+/** [threads] is whatever can be shown right now, including the previous list while reloading. */
 sealed class CatalogUiState {
-    object Loading : CatalogUiState()
-    data class Success(val threads: List<CatalogThread>) : CatalogUiState()
-    data class Error(val message: String) : CatalogUiState()
+    abstract val threads: List<CatalogThread>?
+
+    data class Loading(override val threads: List<CatalogThread>? = null) : CatalogUiState()
+    data class Success(override val threads: List<CatalogThread>) : CatalogUiState()
+    data class Error(val message: String, override val threads: List<CatalogThread>? = null) : CatalogUiState()
 }
 
 class CatalogViewModel(
@@ -27,14 +31,10 @@ class CatalogViewModel(
     private var lastSuccessfulLoadAtMs: Long = 0L
     private val threadCountOverrides = LinkedHashMap<Pair<String, Long>, Pair<Int, Int>>()
 
-    private val _state = MutableStateFlow<CatalogUiState>(CatalogUiState.Loading)
+    private val _state = MutableStateFlow<CatalogUiState>(CatalogUiState.Loading())
     val state: StateFlow<CatalogUiState> = _state
 
-    fun load(
-        boardName: String = board,
-        forceRefresh: Boolean = false,
-        retryOnFailure: Boolean = false
-    ) {
+    fun load(boardName: String = board, forceRefresh: Boolean = false) {
         if (!forceRefresh && lastSuccessfulBoard == boardName &&
             _state.value is CatalogUiState.Success &&
             System.currentTimeMillis() - lastSuccessfulLoadAtMs < AUTO_REFRESH_INTERVAL_MS
@@ -42,33 +42,20 @@ class CatalogViewModel(
             return
         }
 
+        val previous = _state.value.threads.takeIf { lastSuccessfulBoard == boardName }
         board = boardName
         loadJob?.cancel()
         loadJob = viewModelScope.launch {
-            _state.value = CatalogUiState.Loading
-            val firstAttempt = runCatching { repo.getCatalogThreads(board, forceRefresh = forceRefresh) }
-            if (firstAttempt.isSuccess) {
+            _state.value = CatalogUiState.Loading(previous)
+            try {
+                val fresh = repo.getCatalogThreads(board, forceRefresh = forceRefresh)
                 lastSuccessfulBoard = board
                 lastSuccessfulLoadAtMs = System.currentTimeMillis()
-                _state.value = CatalogUiState.Success(applyThreadCountOverrides(board, firstAttempt.getOrThrow()))
-                return@launch
-            }
-            if (retryOnFailure) {
-                delay(700)
-                val retryAttempt = runCatching { repo.getCatalogThreads(board, forceRefresh = true) }
-                if (retryAttempt.isSuccess) {
-                    lastSuccessfulBoard = board
-                    lastSuccessfulLoadAtMs = System.currentTimeMillis()
-                    _state.value = CatalogUiState.Success(applyThreadCountOverrides(board, retryAttempt.getOrThrow()))
-                    return@launch
-                }
-                _state.value = CatalogUiState.Error(
-                    retryAttempt.exceptionOrNull()?.message
-                        ?: firstAttempt.exceptionOrNull()?.message
-                        ?: "Unknown error"
-                )
-            } else {
-                _state.value = CatalogUiState.Error(firstAttempt.exceptionOrNull()?.message ?: "Unknown error")
+                _state.value = CatalogUiState.Success(applyThreadCountOverrides(board, fresh))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.value = CatalogUiState.Error(e.userMessage("Failed to load the catalog"), previous)
             }
         }
     }

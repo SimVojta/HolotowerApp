@@ -51,23 +51,10 @@ data class CatalogThread(
             (omittedImages + lastReplies.orEmpty().count { it.tim != null }).coerceAtLeast(0)
         )
 
-    fun thumbnailUrls(board: String): List<String> {
-        val t = tim ?: return emptyList()
-        val preferred = when (ext?.lowercase()) {
-            ".png" -> listOf(".png", ".jpg", ".webp")
-            else -> listOf(".jpg", ".png", ".webp")
-        }
-        val primary = preferred.first()
-        val rest = preferred.drop(1)
-        return buildList {
-            add("https://holotower.org/$board/thumb/$t$primary")
-            add("https://holotower.org/$board/thumb/${t}s$primary")
-            rest.forEach { suffix ->
-                add("https://holotower.org/$board/thumb/$t$suffix")
-                add("https://holotower.org/$board/thumb/${t}s$suffix")
-            }
-        }.distinct()
-    }
+    val isSpoiler get() = spoiler == 1
+
+    fun thumbnailUrls(board: String): List<String> =
+        ThumbnailResolver.candidates(board, tim, ext, spoiler)
 
     fun thumbnailUrl(board: String): String? = thumbnailUrls(board).firstOrNull()
 

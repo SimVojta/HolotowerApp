@@ -16,12 +16,21 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.ExperimentalMaterialApi
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.pullrefresh.pullRefresh
 import androidx.compose.material.pullrefresh.rememberPullRefreshState
 import androidx.compose.material3.Button
@@ -33,6 +42,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -41,50 +51,92 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
-import coil3.compose.AsyncImage
 import com.holotower.app.R
+import com.holotower.app.data.local.ThreadSeenStore
 import com.holotower.app.data.model.CatalogThread
-import com.holotower.app.data.network.ForegroundChallengePolicy
+import com.holotower.app.data.network.AppForeground
+import com.holotower.app.ui.common.PostThumbnail
 import com.holotower.app.viewmodel.CatalogUiState
 import com.holotower.app.viewmodel.CatalogViewModel
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
-private enum class CatalogSortMode {
-    BumpOrder,
-    MostReplies,
-    MostImages,
-    Newest,
-    Oldest
+private enum class CatalogSortMode(val label: String) {
+    BumpOrder("Bump order"),
+    MostReplies("Most replies"),
+    MostImages("Most images"),
+    Newest("Newest"),
+    Oldest("Oldest")
 }
+
+private data class CatalogFilters(
+    val query: String,
+    val sort: CatalogSortMode,
+    val onlyWithImages: Boolean,
+    val hideSticky: Boolean,
+    val hideLocked: Boolean
+)
 
 private const val CATALOG_SWIPE_THRESHOLD = 90f
 private const val OVERLAY_DRAG_DAMP = 0.45f
 private const val OVERLAY_DRAG_CLAMP = 220f
+private val Accent = Color(0xFF00FF9F)
+
+private fun plainText(thread: CatalogThread): String =
+    Html.fromHtml(
+        listOfNotNull(thread.sub, thread.com).joinToString("\n"),
+        Html.FROM_HTML_MODE_COMPACT
+    ).toString().trim()
+
+private fun applyFilters(
+    threads: List<CatalogThread>,
+    searchText: Map<Long, String>,
+    filters: CatalogFilters
+): List<CatalogThread> {
+    val query = filters.query.trim().lowercase()
+    val filtered = threads.filter { thread ->
+        (!filters.onlyWithImages || thread.imageReplyCount > 0 || thread.tim != null) &&
+            (!filters.hideSticky || !thread.isSticky) &&
+            (!filters.hideLocked || !thread.isLocked) &&
+            (query.isBlank() ||
+                searchText[thread.no]?.contains(query) == true ||
+                thread.no.toString().contains(query))
+    }
+    return when (filters.sort) {
+        CatalogSortMode.BumpOrder -> filtered.sortedByDescending { it.lastModified }
+        CatalogSortMode.MostReplies -> filtered.sortedWith(
+            compareByDescending<CatalogThread> { it.replyCount }.thenByDescending { it.lastModified }
+        )
+        CatalogSortMode.MostImages -> filtered.sortedWith(
+            compareByDescending<CatalogThread> { it.imageReplyCount }.thenByDescending { it.lastModified }
+        )
+        CatalogSortMode.Newest -> filtered.sortedByDescending { it.time }
+        CatalogSortMode.Oldest -> filtered.sortedBy { it.time }
+    }
+}
 
 @OptIn(ExperimentalMaterialApi::class, ExperimentalMaterial3Api::class)
 @Composable
@@ -94,32 +146,16 @@ fun CatalogScreen(
     onNewThreadSwipe: () -> Unit = {},
     onGlobalEntryClick: () -> Unit = {},
     isCurrentDestination: Boolean = true,
-    onRefreshCloudflare: (() -> Unit)? = null,
     vm: CatalogViewModel = viewModel()
 ) {
     val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
     val prefs = remember(context) {
         context.getSharedPreferences("catalog_filters", Context.MODE_PRIVATE)
     }
     val prefKeyPrefix = remember(board) { "catalog_${board}_" }
     val state by vm.state.collectAsState()
     val isRefreshing = state is CatalogUiState.Loading
-    val successThreads = (state as? CatalogUiState.Success)?.threads
-    var cachedThreads by remember { mutableStateOf<List<CatalogThread>>(emptyList()) }
-    LaunchedEffect(successThreads) {
-        if (successThreads != null) cachedThreads = successThreads
-    }
-
-    val isBlockingLoad = isRefreshing && cachedThreads.isEmpty()
-    var showCloudflareRefreshButton by remember { mutableStateOf(false) }
-    LaunchedEffect(isBlockingLoad) {
-        showCloudflareRefreshButton = false
-        if (isBlockingLoad) {
-            delay(2000)
-            showCloudflareRefreshButton = true
-        }
-    }
+    val threads = state.threads
 
     val savedQuery = remember(board) { prefs.getString("${prefKeyPrefix}query", "").orEmpty() }
     var showSearch by remember(board) { mutableStateOf(savedQuery.isNotBlank()) }
@@ -138,14 +174,9 @@ fun CatalogScreen(
     var onlyWithImages by remember(board) { mutableStateOf(prefs.getBoolean("${prefKeyPrefix}only_images", false)) }
     var hideSticky by remember(board) { mutableStateOf(prefs.getBoolean("${prefKeyPrefix}hide_sticky", false)) }
     var hideLocked by remember(board) { mutableStateOf(prefs.getBoolean("${prefKeyPrefix}hide_locked", false)) }
+    val filters = CatalogFilters(searchQuery, sortMode, onlyWithImages, hideSticky, hideLocked)
 
-    val showTopRefreshBadge = isRefreshing && cachedThreads.isNotEmpty()
-    val pullRefreshState = rememberPullRefreshState(
-        refreshing = isRefreshing,
-        onRefresh = { vm.load(boardName = board, forceRefresh = true) }
-    )
-
-    LaunchedEffect(searchQuery, sortMode, onlyWithImages, hideSticky, hideLocked, board) {
+    LaunchedEffect(filters, board) {
         prefs.edit()
             .putString("${prefKeyPrefix}query", searchQuery)
             .putString("${prefKeyPrefix}sort", sortMode.name)
@@ -155,70 +186,57 @@ fun CatalogScreen(
             .apply()
     }
 
-    fun applyCatalogViewOptions(threads: List<CatalogThread>): List<CatalogThread> {
-        val query = searchQuery.trim().lowercase()
-        val filtered = threads.asSequence()
-            .filter { if (onlyWithImages) it.imageReplyCount > 0 || it.tim != null else true }
-            .filter { if (hideSticky) !it.isSticky else true }
-            .filter { if (hideLocked) !it.isLocked else true }
-            .filter { thread ->
-                if (query.isBlank()) return@filter true
-                val cleanText = Html.fromHtml(
-                    "${thread.sub.orEmpty()}\n${thread.com.orEmpty()}",
-                    Html.FROM_HTML_MODE_COMPACT
-                ).toString().lowercase()
-                cleanText.contains(query) || thread.no.toString().contains(query)
-            }
-            .toList()
+    // Plain text of every thread, built once per catalog load and only while searching.
+    val searching = searchQuery.isNotBlank()
+    val searchText = remember(threads, searching) {
+        if (!searching) emptyMap() else threads.orEmpty().associate { it.no to plainText(it).lowercase() }
+    }
+    val visibleThreads = remember(threads, searchText, filters) {
+        threads?.let { applyFilters(it, searchText, filters) }
+    }
+    val gridState = rememberLazyGridState()
 
-        return when (sortMode) {
-            CatalogSortMode.BumpOrder -> filtered.sortedByDescending { it.lastModified }
-            CatalogSortMode.MostReplies -> filtered.sortedWith(
-                compareByDescending<CatalogThread> { it.replyCount }.thenByDescending { it.lastModified }
-            )
-            CatalogSortMode.MostImages -> filtered.sortedWith(
-                compareByDescending<CatalogThread> { it.imageReplyCount }.thenByDescending { it.lastModified }
-            )
-            CatalogSortMode.Newest -> filtered.sortedByDescending { it.time }
-            CatalogSortMode.Oldest -> filtered.sortedBy { it.time }
+    // Reply counts seen when each thread was last opened, for the "+N" badge.
+    var seenReplies by remember(board) { mutableStateOf(emptyMap<Long, Int>()) }
+    LaunchedEffect(board, isCurrentDestination, state is CatalogUiState.Success) {
+        if (!isCurrentDestination) return@LaunchedEffect
+        val success = state as? CatalogUiState.Success
+        seenReplies = withContext(Dispatchers.IO) {
+            if (success != null) {
+                ThreadSeenStore.prune(context, board, success.threads.mapTo(HashSet()) { it.no })
+            }
+            ThreadSeenStore.load(context, board)
         }
     }
 
     LaunchedEffect(board, isCurrentDestination) {
-        if (isCurrentDestination) {
-            // Reuse a recent catalog response after returning from a thread.
-            // CatalogViewModel refreshes automatically only after its short TTL;
-            // pull-to-refresh still forces an immediate fetch.
-            vm.load(boardName = board, retryOnFailure = true)
+        // Reuses a recent catalog after returning from a thread; the view model refreshes
+        // on its own after a short TTL, and pull-to-refresh always forces a fetch.
+        if (isCurrentDestination) vm.load(boardName = board)
+    }
+
+    // Coming back to the app after a while: refresh in place, keeping the grid visible.
+    val returnToken by AppForeground.returnsAfterIdle.collectAsState()
+    var handledReturnToken by rememberSaveable { mutableIntStateOf(returnToken) }
+    LaunchedEffect(returnToken, isCurrentDestination) {
+        if (isCurrentDestination && returnToken != handledReturnToken) {
+            handledReturnToken = returnToken
+            vm.load(boardName = board, forceRefresh = true)
         }
     }
 
+    val pullRefreshState = rememberPullRefreshState(
+        refreshing = isRefreshing,
+        onRefresh = { vm.load(boardName = board, forceRefresh = true) }
+    )
     var swipeX by remember { mutableStateOf(0f) }
-    var lastHandledBackgroundToken by remember { mutableStateOf(0L) }
-
-    DisposableEffect(lifecycleOwner, onRefreshCloudflare) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event != Lifecycle.Event.ON_START || onRefreshCloudflare == null) return@LifecycleEventObserver
-            val backgroundToken = ForegroundChallengePolicy.backgroundToken()
-            val shouldRefresh = backgroundToken != lastHandledBackgroundToken &&
-                ForegroundChallengePolicy.shouldRecheckFor(backgroundToken)
-            if (shouldRefresh) {
-                lastHandledBackgroundToken = backgroundToken
-                onRefreshCloudflare()
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
-    }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier.clickable(onClick = onGlobalEntryClick)
-                        ) {
+                        Box(modifier = Modifier.clickable(onClick = onGlobalEntryClick)) {
                             Icon(
                                 painter = painterResource(id = R.drawable.ic_holo_logo),
                                 contentDescription = "Global Entry",
@@ -230,70 +248,34 @@ fun CatalogScreen(
                     }
                 },
                 actions = {
-                    TextButton(
-                        onClick = {
-                            showSearch = !showSearch
-                            if (!showSearch) searchQuery = ""
-                        }
-                    ) {
-                        Text(if (showSearch) "Hide" else "Search", color = Color.White, fontSize = 13.sp)
+                    IconButton(onClick = {
+                        showSearch = !showSearch
+                        if (!showSearch) searchQuery = ""
+                    }) {
+                        Icon(
+                            if (showSearch) Icons.Filled.Close else Icons.Filled.Search,
+                            contentDescription = if (showSearch) "Close search" else "Search",
+                            tint = Color.White
+                        )
                     }
                     Box {
-                        TextButton(onClick = { showOptionsMenu = true }) {
-                            Text("Sort/Filter", color = Color.White, fontSize = 13.sp)
+                        IconButton(onClick = { showOptionsMenu = true }) {
+                            Icon(Icons.Filled.MoreVert, contentDescription = "Sort and filter", tint = Color.White)
                         }
                         DropdownMenu(
                             expanded = showOptionsMenu,
                             onDismissRequest = { showOptionsMenu = false }
                         ) {
-                            DropdownMenuItem(
-                                text = { Text((if (sortMode == CatalogSortMode.BumpOrder) "[x] " else "[ ] ") + "Bump order") },
-                                onClick = {
-                                    sortMode = CatalogSortMode.BumpOrder
+                            CatalogSortMode.entries.forEach { mode ->
+                                MenuOption(mode.label, checked = sortMode == mode) {
+                                    sortMode = mode
                                     showOptionsMenu = false
                                 }
-                            )
-                            DropdownMenuItem(
-                                text = { Text((if (sortMode == CatalogSortMode.MostReplies) "[x] " else "[ ] ") + "Most replies") },
-                                onClick = {
-                                    sortMode = CatalogSortMode.MostReplies
-                                    showOptionsMenu = false
-                                }
-                            )
-                            DropdownMenuItem(
-                                text = { Text((if (sortMode == CatalogSortMode.MostImages) "[x] " else "[ ] ") + "Most images") },
-                                onClick = {
-                                    sortMode = CatalogSortMode.MostImages
-                                    showOptionsMenu = false
-                                }
-                            )
-                            DropdownMenuItem(
-                                text = { Text((if (sortMode == CatalogSortMode.Newest) "[x] " else "[ ] ") + "Newest") },
-                                onClick = {
-                                    sortMode = CatalogSortMode.Newest
-                                    showOptionsMenu = false
-                                }
-                            )
-                            DropdownMenuItem(
-                                text = { Text((if (sortMode == CatalogSortMode.Oldest) "[x] " else "[ ] ") + "Oldest") },
-                                onClick = {
-                                    sortMode = CatalogSortMode.Oldest
-                                    showOptionsMenu = false
-                                }
-                            )
+                            }
                             HorizontalDivider()
-                            DropdownMenuItem(
-                                text = { Text((if (onlyWithImages) "[x] " else "[ ] ") + "Only with images") },
-                                onClick = { onlyWithImages = !onlyWithImages }
-                            )
-                            DropdownMenuItem(
-                                text = { Text((if (hideSticky) "[x] " else "[ ] ") + "Hide sticky") },
-                                onClick = { hideSticky = !hideSticky }
-                            )
-                            DropdownMenuItem(
-                                text = { Text((if (hideLocked) "[x] " else "[ ] ") + "Hide locked") },
-                                onClick = { hideLocked = !hideLocked }
-                            )
+                            MenuOption("Only with images", checked = onlyWithImages) { onlyWithImages = !onlyWithImages }
+                            MenuOption("Hide sticky", checked = hideSticky) { hideSticky = !hideSticky }
+                            MenuOption("Hide locked", checked = hideLocked) { hideLocked = !hideLocked }
                         }
                     }
                 },
@@ -308,9 +290,7 @@ fun CatalogScreen(
                 .fillMaxSize()
                 .offset {
                     val clamped = swipeX.coerceIn(-OVERLAY_DRAG_CLAMP, 0f)
-                    val translation = (clamped * OVERLAY_DRAG_DAMP)
-                        .coerceIn(-OVERLAY_DRAG_CLAMP, OVERLAY_DRAG_CLAMP)
-                    IntOffset(translation.roundToInt(), 0)
+                    IntOffset((clamped * OVERLAY_DRAG_DAMP).roundToInt(), 0)
                 }
                 .pullRefresh(pullRefreshState)
                 .pointerInput(onNewThreadSwipe) {
@@ -340,11 +320,11 @@ fun CatalogScreen(
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedTextColor = Color(0xFFEAEAEA),
                             unfocusedTextColor = Color(0xFFEAEAEA),
-                            focusedBorderColor = Color(0xFF00FF9F),
+                            focusedBorderColor = Accent,
                             unfocusedBorderColor = Color(0xFF2A2F35),
                             focusedLabelColor = Color(0xFFBFC5CC),
                             unfocusedLabelColor = Color(0xFF9CA3AF),
-                            cursorColor = Color(0xFF00FF9F)
+                            cursorColor = Accent
                         ),
                         modifier = Modifier
                             .fillMaxWidth()
@@ -352,61 +332,34 @@ fun CatalogScreen(
                     )
                 }
 
+                (state as? CatalogUiState.Error)?.takeIf { threads != null }?.let { error ->
+                    ErrorBanner(error.message) { vm.load(boardName = board, forceRefresh = true) }
+                }
+
                 Box(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
                 ) {
-                    when (val s = state) {
-                        is CatalogUiState.Loading -> {
-                            if (cachedThreads.isEmpty()) {
-                                Column(
-                                    modifier = Modifier.align(Alignment.Center),
-                                    horizontalAlignment = Alignment.CenterHorizontally
-                                ) {
-                                    CircularProgressIndicator(color = Color(0xFF00FF9F))
-                                    if (showCloudflareRefreshButton) {
-                                        Spacer(modifier = Modifier.height(14.dp))
-                                        Button(
-                                            onClick = {
-                                                onRefreshCloudflare?.invoke()
-                                                    ?: vm.load(boardName = board, forceRefresh = true)
-                                            }
-                                        ) {
-                                            Text("Refresh for Cloudflare")
-                                        }
-                                    }
-                                }
-                            } else {
-                                CatalogGrid(applyCatalogViewOptions(cachedThreads), board, onThreadClick)
+                    val shown = visibleThreads
+                    when {
+                        shown != null -> CatalogGrid(shown, board, seenReplies, gridState, onThreadClick)
+                        state is CatalogUiState.Error -> Column(
+                            Modifier.align(Alignment.Center).padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text((state as CatalogUiState.Error).message, color = Color(0xFFFF6A6A))
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Button(onClick = { vm.load(boardName = board, forceRefresh = true) }) {
+                                Text("Retry")
                             }
                         }
-
-                        is CatalogUiState.Error -> {
-                            Column(
-                                Modifier.align(Alignment.Center),
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                Text("Error: ${s.message}", color = Color.Red)
-                                Button(onClick = { vm.load(boardName = board, forceRefresh = true) }) {
-                                    Text("Retry")
-                                }
-                                if (s.message.contains("cloudflare", ignoreCase = true) && onRefreshCloudflare != null) {
-                                    Button(onClick = onRefreshCloudflare) {
-                                        Text("Open Cloudflare check")
-                                    }
-                                }
-                            }
-                        }
-
-                        is CatalogUiState.Success -> {
-                            CatalogGrid(applyCatalogViewOptions(s.threads), board, onThreadClick)
-                        }
+                        else -> CircularProgressIndicator(color = Accent, modifier = Modifier.align(Alignment.Center))
                     }
                 }
             }
 
-            if (showTopRefreshBadge) {
+            if (isRefreshing && threads != null) {
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
@@ -416,7 +369,7 @@ fun CatalogScreen(
                 ) {
                     Icon(
                         painter = painterResource(id = R.drawable.ic_holo_logo),
-                        contentDescription = null,
+                        contentDescription = "Refreshing",
                         tint = Color.Unspecified
                     )
                 }
@@ -426,9 +379,47 @@ fun CatalogScreen(
 }
 
 @Composable
+private fun MenuOption(label: String, checked: Boolean, onClick: () -> Unit) {
+    DropdownMenuItem(
+        text = { Text(label) },
+        leadingIcon = {
+            if (checked) {
+                Icon(Icons.Filled.Check, contentDescription = null, tint = Accent)
+            } else {
+                Spacer(modifier = Modifier.size(24.dp))
+            }
+        },
+        onClick = onClick
+    )
+}
+
+@Composable
+private fun ErrorBanner(message: String, onRetry: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xEE1A1111))
+            .padding(start = 12.dp, end = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            "Refresh failed: $message",
+            color = Color(0xFFFFD6D6),
+            fontSize = 12.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        TextButton(onClick = onRetry) { Text("Retry", color = Accent) }
+    }
+}
+
+@Composable
 private fun CatalogGrid(
     threads: List<CatalogThread>,
     board: String,
+    seenReplies: Map<Long, Int>,
+    gridState: LazyGridState,
     onThreadClick: (Long) -> Unit
 ) {
     if (threads.isEmpty()) {
@@ -439,19 +430,22 @@ private fun CatalogGrid(
     }
 
     LazyVerticalGrid(
-        columns = GridCells.Fixed(2),
+        state = gridState,
+        columns = GridCells.Adaptive(minSize = 165.dp),
         contentPadding = PaddingValues(8.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        items(threads) { thread ->
-            CatalogCard(thread, board, onThreadClick)
+        items(threads, key = { it.no }) { thread ->
+            val seen = seenReplies[thread.no]
+            val newReplies = if (seen != null) (thread.replyCount - seen).coerceAtLeast(0) else 0
+            CatalogCard(thread, board, newReplies, onThreadClick)
         }
     }
 }
 
 @Composable
-fun CatalogCard(thread: CatalogThread, board: String, onClick: (Long) -> Unit) {
+fun CatalogCard(thread: CatalogThread, board: String, newReplies: Int = 0, onClick: (Long) -> Unit) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -460,49 +454,49 @@ fun CatalogCard(thread: CatalogThread, board: String, onClick: (Long) -> Unit) {
         shape = RoundedCornerShape(6.dp)
     ) {
         Column {
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .height(160.dp)
-                    .background(Color.Black),
-                contentAlignment = Alignment.Center
-            ) {
-                val thumbUrls = thread.thumbnailUrls(board)
-                var thumbIndex by remember(thread.no, board) { mutableStateOf(0) }
-                var thumbExhausted by remember(thread.no, board) { mutableStateOf(false) }
-                thumbUrls.getOrNull(thumbIndex)?.takeUnless { thumbExhausted }?.let { url ->
-                    AsyncImage(
-                        model = url,
-                        contentDescription = null,
-                        onError = {
-                            if (thumbIndex < thumbUrls.lastIndex) {
-                                thumbIndex += 1
-                            } else {
-                                thumbExhausted = true
-                            }
-                        },
-                        alignment = Alignment.TopCenter,
-                        contentScale = ContentScale.Crop,
+            Box {
+                val thumbUrls = remember(thread.no, thread.tim, thread.ext, board) { thread.thumbnailUrls(board) }
+                PostThumbnail(
+                    urls = thumbUrls,
+                    ext = thread.ext,
+                    isSpoiler = thread.isSpoiler,
+                    labelSize = 12.sp,
+                    background = Color.Black,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(160.dp)
+                )
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    if (thread.isSticky) Badge("STICKY", Color(0xFF2E5BFF))
+                    if (thread.isLocked) Badge("LOCKED", Color(0xFF8A5A00), Icons.Filled.Lock)
+                }
+                if (newReplies > 0) {
+                    Badge(
+                        "+$newReplies",
+                        Color(0xFF007A4D),
                         modifier = Modifier
-                            .fillMaxSize()
+                            .align(Alignment.TopEnd)
+                            .padding(6.dp)
                     )
-                } ?: Text("SPOILER", color = Color(0xFFFF5A5A), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
             }
 
             Column(Modifier.padding(10.dp)) {
                 Text(
                     "R:${thread.replyCount}  I:${thread.imageReplyCount}",
-                    color = Color(0xFF00FF9F),
+                    color = Accent,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold
                 )
                 Spacer(Modifier.height(4.dp))
 
                 val plain = remember(thread.no, thread.sub, thread.com) {
-                    Html.fromHtml(
-                        listOfNotNull(thread.sub, thread.com).joinToString("\n"),
-                        Html.FROM_HTML_MODE_COMPACT
-                    ).toString().trim().ifBlank { "Thread #${thread.no}" }
+                    plainText(thread).ifBlank { "Thread #${thread.no}" }
                 }
 
                 Text(
@@ -515,5 +509,26 @@ fun CatalogCard(thread: CatalogThread, board: String, onClick: (Long) -> Unit) {
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun Badge(
+    text: String,
+    color: Color,
+    icon: ImageVector? = null,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier
+            .background(color.copy(alpha = 0.9f), RoundedCornerShape(4.dp))
+            .padding(horizontal = 5.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (icon != null) {
+            Icon(icon, contentDescription = null, tint = Color.White, modifier = Modifier.size(10.dp))
+            Spacer(modifier = Modifier.width(2.dp))
+        }
+        Text(text, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
     }
 }

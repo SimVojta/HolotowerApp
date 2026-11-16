@@ -4,11 +4,6 @@ import android.content.Intent
 import android.net.Uri
 import android.text.Html
 import android.webkit.CookieManager
-import android.webkit.ValueCallback
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -44,10 +39,15 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.ExperimentalMaterialApi
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.pullrefresh.PullRefreshIndicator
+import androidx.compose.material.pullrefresh.pullRefresh
+import androidx.compose.material.pullrefresh.rememberPullRefreshState
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -68,8 +68,10 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -88,9 +90,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.MediaItem
@@ -102,12 +101,14 @@ import androidx.media3.ui.PlayerView
 import coil3.compose.AsyncImage
 import com.holotower.app.R
 import com.holotower.app.data.local.ThreadPositionStore
+import com.holotower.app.data.local.ThreadSeenStore
 import com.holotower.app.data.model.Post
+import com.holotower.app.data.network.AppForeground
 import com.holotower.app.data.network.CloudflareHelper
-import com.holotower.app.data.network.ForegroundChallengePolicy
 import com.holotower.app.data.network.RetrofitClient
 import com.holotower.app.data.repository.BoardRepository
 import com.holotower.app.ui.common.PostCard
+import com.holotower.app.ui.common.PostThumbnail
 import com.holotower.app.viewmodel.ThreadUiState
 import com.holotower.app.viewmodel.ThreadViewModel
 import kotlinx.coroutines.FlowPreview
@@ -126,7 +127,7 @@ import kotlin.math.roundToInt
 private val BackgroundColor = Color(0xFF111111)
 private val TextPrimary = Color(0xFFEAEAEA)
 private val AccentRed = Color(0xFFD65D5D)
-private val LoadingGreen = Color(0xFF00FF9F)
+internal val LoadingGreen = Color(0xFF00FF9F)
 
 private val replyRegex = Regex(">>(\\d+)")
 private val anchorRegex = Regex("""(?is)<a[^>]*href=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>""")
@@ -143,7 +144,7 @@ private const val GALLERY_NAV_THRESHOLD = 90f
 private const val THREAD_NAV_THRESHOLD = 90f
 private const val OVERLAY_DRAG_DAMP = 0.45f
 private const val OVERLAY_DRAG_CLAMP = 220f
-private const val COMPOSER_CLOSE_THRESHOLD = 90f
+
 private const val CUE_SHOW_THRESHOLD = 28f
 private const val QUICK_SWIPE_MIN_DISTANCE = 26f
 private const val QUICK_SWIPE_MAX_DURATION_MS = 160L
@@ -158,6 +159,8 @@ private data class GalleryMediaItem(
     val postNo: Long,
     val url: String,
     val thumbnailUrls: List<String>,
+    val ext: String?,
+    val isSpoiler: Boolean,
     val fileName: String,
     val kind: MediaKind,
     val formatLabel: String,
@@ -237,13 +240,15 @@ private fun inferReferer(url: String): String {
 }
 
 @Composable
-fun ErrorView(message: String, onRetry: () -> Unit, onRefreshCloudflare: (() -> Unit)? = null) {
+fun ErrorView(message: String, onRetry: () -> Unit) {
     Column(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text(text = "Error: $message", color = AccentRed)
+        Text(text = message, color = AccentRed)
         Spacer(modifier = Modifier.height(16.dp))
         Button(
             onClick = onRetry,
@@ -251,18 +256,28 @@ fun ErrorView(message: String, onRetry: () -> Unit, onRefreshCloudflare: (() -> 
         ) {
             Text("Retry", color = Color.White)
         }
-        if (onRefreshCloudflare != null && isCloudflareChallengeError(message)) {
-            Spacer(modifier = Modifier.height(8.dp))
-            Button(onClick = onRefreshCloudflare) {
-                Text("Open Cloudflare check")
-            }
-        }
     }
 }
 
-private fun isCloudflareChallengeError(message: String): Boolean =
-    message.contains("cloudflare", ignoreCase = true) ||
-        message.contains("security check", ignoreCase = true)
+@Composable
+private fun NewPostsDivider(count: Int) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(modifier = Modifier.weight(1f).height(1.dp).background(LoadingGreen))
+        Text(
+            text = if (count == 1) "1 new post" else "$count new posts",
+            color = LoadingGreen,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 8.dp)
+        )
+        Box(modifier = Modifier.weight(1f).height(1.dp).background(LoadingGreen))
+    }
+}
 
 private suspend fun loadMiniThreadConversation(
     selection: MiniThreadSelection,
@@ -382,6 +397,8 @@ private fun buildMediaItems(posts: List<Post>, board: String): List<GalleryMedia
             postNo = post.no,
             url = url,
             thumbnailUrls = post.thumbnailUrls(board),
+            ext = post.ext,
+            isSpoiler = post.isSpoiler,
             fileName = suggestMediaFileName(post),
             kind = kind,
             formatLabel = if (kind == MediaKind.Video && normalizedExt.isNotBlank()) {
@@ -473,7 +490,7 @@ private fun buildThreadHeaderSecondaryLine(board: String, posts: List<Post>, thr
 }
 
 @Composable
-private fun BottomOverlayButton(
+internal fun BottomOverlayButton(
     text: String,
     onClick: () -> Unit
 ) {
@@ -525,7 +542,7 @@ private fun overlayTranslationX(rawSwipeX: Float): Float {
 }
 
 @Composable
-private fun HorizontalSwipeLayer(
+internal fun HorizontalSwipeLayer(
     modifier: Modifier = Modifier,
     enabled: Boolean,
     threshold: Float,
@@ -638,15 +655,13 @@ private fun VerticalProgressBar(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class, FlowPreview::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class, FlowPreview::class, ExperimentalMaterialApi::class)
 @Composable
 fun ThreadScreen(
     board: String,
     threadNo: Long,
-    refreshAfterCloudflareToken: Long = 0L,
     onBack: () -> Unit,
     onOpenThread: (Long) -> Unit = {},
-    onRefreshCloudflare: (() -> Unit)? = null,
     onThreadCountsUpdated: (replies: Int, images: Int) -> Unit = { _, _ -> },
     isCurrentDestination: Boolean = true,
     vm: ThreadViewModel = viewModel(factory = ThreadViewModel.Factory(board, threadNo))
@@ -655,19 +670,37 @@ fun ThreadScreen(
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
     val repo = remember(context.applicationContext) { BoardRepository(context.applicationContext) }
 
     val successPosts = (state as? ThreadUiState.Success)?.posts
+    // The state carries the previous/saved posts while loading; cachedPosts only covers
+    // the moment between a state change and the next composition.
     var cachedPosts by remember { mutableStateOf<List<Post>>(emptyList()) }
-    LaunchedEffect(successPosts) { if (successPosts != null) cachedPosts = successPosts }
-    val allPosts = successPosts ?: cachedPosts
+    LaunchedEffect(state.posts) { state.posts?.let { cachedPosts = it } }
+    val allPosts = state.posts ?: cachedPosts
     LaunchedEffect(board, threadNo, successPosts) {
         val posts = successPosts ?: return@LaunchedEffect
-        onThreadCountsUpdated(
-            (posts.size - 1).coerceAtLeast(0),
-            posts.drop(1).count { !it.tim.isNullOrBlank() }
-        )
+        val replies = (posts.size - 1).coerceAtLeast(0)
+        onThreadCountsUpdated(replies, posts.drop(1).count { !it.tim.isNullOrBlank() })
+        withContext(Dispatchers.IO) { ThreadSeenStore.markSeen(context, board, threadNo, replies) }
+    }
+
+    // "N new posts" divider: posts newer than what was on screen (or saved) before a refresh.
+    var lastShownPostNo by remember(threadNo) { mutableStateOf<Long?>(null) }
+    var firstNewPostNo by remember(threadNo) { mutableStateOf<Long?>(null) }
+    var newPostCount by remember(threadNo) { mutableIntStateOf(0) }
+    LaunchedEffect(state) {
+        val posts = state.posts ?: return@LaunchedEffect
+        val lastNo = posts.lastOrNull()?.no ?: return@LaunchedEffect
+        val previous = lastShownPostNo
+        if (state is ThreadUiState.Success && previous != null) {
+            val fresh = posts.filter { it.no > previous }
+            if (fresh.isNotEmpty()) {
+                firstNewPostNo = fresh.first().no
+                newPostCount = fresh.size
+            }
+        }
+        if (state is ThreadUiState.Success || previous == null) lastShownPostNo = lastNo
     }
     val mediaItems = remember(allPosts, board) { buildMediaItems(allPosts, board) }
     var galleryFilter by remember { mutableStateOf(GalleryFilter.All) }
@@ -686,15 +719,15 @@ fun ThreadScreen(
     }
 
     val isRefreshing = state is ThreadUiState.Loading
-    val showTopRefreshBadge = isRefreshing && cachedPosts.isNotEmpty()
-    var showCloudflareRefreshButton by remember { mutableStateOf(false) }
-    LaunchedEffect(isRefreshing, cachedPosts.isEmpty()) {
-        showCloudflareRefreshButton = false
-        if (isRefreshing && cachedPosts.isEmpty()) {
-            delay(2000)
-            showCloudflareRefreshButton = true
+    var userPulledToRefresh by remember { mutableStateOf(false) }
+    LaunchedEffect(isRefreshing) { if (!isRefreshing) userPulledToRefresh = false }
+    val pullRefreshState = rememberPullRefreshState(
+        refreshing = userPulledToRefresh && isRefreshing,
+        onRefresh = {
+            userPulledToRefresh = true
+            vm.load(forceRefresh = true)
         }
-    }
+    )
     var selectedMediaIndex by remember { mutableIntStateOf(-1) }
     var pendingSave by remember { mutableStateOf<GalleryMediaItem?>(null) }
     var selectedMiniThread by remember { mutableStateOf<MiniThreadSelection?>(null) }
@@ -806,31 +839,14 @@ fun ThreadScreen(
         }
     }
 
-    LaunchedEffect(refreshAfterCloudflareToken) {
-        if (refreshAfterCloudflareToken != 0L) {
-            delay(350)
-            vm.load(forceRefresh = true, retryOnFailure = true)
+    // Coming back to the app after a while: refresh in place, keeping the posts on screen.
+    val returnToken by AppForeground.returnsAfterIdle.collectAsState()
+    var handledReturnToken by rememberSaveable(threadNo) { mutableIntStateOf(returnToken) }
+    LaunchedEffect(returnToken, isCurrentDestination, anyOverlayOpen) {
+        if (isCurrentDestination && !anyOverlayOpen && returnToken != handledReturnToken) {
+            handledReturnToken = returnToken
+            vm.load(forceRefresh = true)
         }
-    }
-
-    var lastHandledBackgroundToken by remember(threadNo) { mutableStateOf(0L) }
-    DisposableEffect(lifecycleOwner, anyOverlayOpen, threadNo) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event != Lifecycle.Event.ON_START || anyOverlayOpen) {
-                return@LifecycleEventObserver
-            }
-            val backgroundToken = ForegroundChallengePolicy.backgroundToken()
-            val shouldRefresh = backgroundToken != lastHandledBackgroundToken &&
-                ForegroundChallengePolicy.shouldRecheckFor(backgroundToken)
-            if (shouldRefresh) {
-                lastHandledBackgroundToken = backgroundToken
-                // Refresh in place so returning to a long-lived thread does not
-                // replace the screen with a challenge while cached posts are usable.
-                vm.load(forceRefresh = true, retryOnFailure = true)
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     val openExternalLink: (String) -> Unit = { rawUrl ->
@@ -893,6 +909,8 @@ fun ThreadScreen(
             contentPadding = PaddingValues(bottom = 16.dp)
         ) {
             items(posts, key = { it.no }) { post ->
+                // Inside the post's own item, so list indices still match post indices.
+                if (post.no == firstNewPostNo && newPostCount > 0) NewPostsDivider(newPostCount)
                 PostCard(
                     post = post,
                     board = board,
@@ -933,6 +951,16 @@ fun ThreadScreen(
             scope.launch { listState.scrollToItem(allPosts.lastIndex) }
         }
     }
+    // After posting: once the refreshed thread arrives, show its end (the new post).
+    var scrollToLatestAfterLoad by remember(threadNo) { mutableStateOf(false) }
+    LaunchedEffect(successPosts, scrollToLatestAfterLoad) {
+        val posts = successPosts ?: return@LaunchedEffect
+        if (scrollToLatestAfterLoad && posts.isNotEmpty()) {
+            scrollToLatestAfterLoad = false
+            listState.scrollToItem(posts.lastIndex)
+        }
+    }
+
     var showJumpToLatestChip by remember(threadNo) { mutableStateOf(false) }
     var jumpToLatestChipToken by remember(threadNo) { mutableIntStateOf(0) }
 
@@ -992,8 +1020,8 @@ fun ThreadScreen(
                     }
                 },
                 actions = {
-                    TextButton(onClick = { replyComposerTargetNo = 0L }) {
-                        Text("Post", color = Color.White, fontSize = 13.sp)
+                    IconButton(onClick = { replyComposerTargetNo = 0L }) {
+                        Icon(Icons.Filled.Edit, contentDescription = "Reply", tint = Color.White)
                     }
                     if (mediaItems.isNotEmpty()) {
                         TextButton(onClick = { showGalleryList = true }) {
@@ -1024,81 +1052,56 @@ fun ThreadScreen(
                 }
             }
         ) {
-            Box(modifier = Modifier.fillMaxSize()) {
-                when (val s = state) {
-                    is ThreadUiState.Loading -> {
-                        if (cachedPosts.isEmpty()) {
-                            Column(
-                                modifier = Modifier.align(Alignment.Center),
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                CircularProgressIndicator(color = LoadingGreen)
-                                if (showCloudflareRefreshButton && onRefreshCloudflare != null) {
-                                    Spacer(modifier = Modifier.height(12.dp))
-                                    Text(
-                                        text = "Cloudflare check needed again",
-                                        color = Color(0xFFB9FFD2),
-                                        fontSize = 13.sp,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                    Spacer(modifier = Modifier.height(6.dp))
-                                    Button(
-                                        onClick = onRefreshCloudflare,
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = Color(0xFF00C27B),
-                                            contentColor = Color(0xFF03150E)
-                                        ),
-                                        shape = RoundedCornerShape(14.dp)
-                                    ) {
-                                        Text("Re-open Cloudflare Challenge", fontWeight = FontWeight.Bold)
-                                    }
-                                }
-                            }
-                        } else {
-                            renderPostList(cachedPosts)
-                        }
-                    }
-                    is ThreadUiState.Error -> {
-                        if (cachedPosts.isEmpty()) {
-                            ErrorView(
-                                message = s.message,
-                                onRetry = { vm.load(forceRefresh = true, retryOnFailure = true) },
-                                onRefreshCloudflare = onRefreshCloudflare
-                            )
-                        } else {
-                            renderPostList(cachedPosts)
-                            Column(
-                                modifier = Modifier
-                                    .align(Alignment.TopCenter)
-                                    .fillMaxWidth()
-                                    .background(Color(0xEE111111))
-                                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                Text(
-                                    text = "Refresh failed: ${s.message}",
-                                    color = Color(0xFFE9FFF5),
-                                    fontSize = 12.sp,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    TextButton(onClick = { vm.load(forceRefresh = true, retryOnFailure = true) }) {
-                                        Text("Retry", color = LoadingGreen)
-                                    }
-                                    if (onRefreshCloudflare != null && isCloudflareChallengeError(s.message)) {
-                                        TextButton(onClick = onRefreshCloudflare) {
-                                            Text("Open Cloudflare check", color = LoadingGreen)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    is ThreadUiState.Success -> renderPostList(s.posts)
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pullRefresh(pullRefreshState, enabled = allPosts.isNotEmpty() && !anyOverlayOpen)
+            ) {
+                val errorState = state as? ThreadUiState.Error
+                when {
+                    allPosts.isNotEmpty() -> renderPostList(allPosts)
+                    errorState != null -> ErrorView(
+                        message = errorState.message,
+                        onRetry = { vm.load(forceRefresh = true) }
+                    )
+                    else -> CircularProgressIndicator(
+                        color = LoadingGreen,
+                        modifier = Modifier.align(Alignment.Center)
+                    )
                 }
 
-                if (showTopRefreshBadge) {
+                if (errorState != null && allPosts.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .fillMaxWidth()
+                            .background(Color(0xEE111111))
+                            .padding(start = 12.dp, end = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Refresh failed: ${errorState.message}",
+                            color = Color(0xFFE9FFF5),
+                            fontSize = 12.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        TextButton(onClick = { vm.load(forceRefresh = true) }) {
+                            Text("Retry", color = LoadingGreen)
+                        }
+                    }
+                }
+
+                PullRefreshIndicator(
+                    refreshing = userPulledToRefresh && isRefreshing,
+                    state = pullRefreshState,
+                    modifier = Modifier.align(Alignment.TopCenter),
+                    backgroundColor = Color(0xFF1E1E1E),
+                    contentColor = LoadingGreen
+                )
+
+                if (isRefreshing && allPosts.isNotEmpty() && !userPulledToRefresh) {
                     Box(
                         modifier = Modifier
                             .align(Alignment.TopCenter)
@@ -1165,7 +1168,7 @@ fun ThreadScreen(
                     }
                 }
 
-                if (!anyOverlayOpen && isRefreshing && cachedPosts.isNotEmpty()) {
+                if (!anyOverlayOpen && isRefreshing && allPosts.isNotEmpty()) {
                     Box(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
@@ -1473,40 +1476,19 @@ fun ThreadScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                var thumbIndex by remember(media.postNo) { mutableStateOf(0) }
-                                var thumbExhausted by remember(media.postNo) { mutableStateOf(false) }
-                                val thumbUrl = media.thumbnailUrls.getOrNull(thumbIndex)
-                                if (thumbUrl != null && !thumbExhausted) {
-                                    AsyncImage(
-                                        model = thumbUrl,
-                                        contentDescription = null,
-                                        onError = {
-                                            if (thumbIndex < media.thumbnailUrls.lastIndex) {
-                                                thumbIndex += 1
-                                            } else {
-                                                thumbExhausted = true
-                                            }
-                                        },
-                                        alignment = Alignment.TopCenter,
-                                        modifier = Modifier
-                                            .size(72.dp)
-                                            .clickable {
-                                                mediaOpenedFromGallery = true
-                                                selectedMediaIndex = mediaIndex
-                                                showGalleryList = false
-                                            },
-                                        contentScale = ContentScale.Crop
-                                    )
-                                } else {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(72.dp)
-                                            .background(Color(0xFF2A2A2A)),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Text("SPOILER", color = Color(0xFFFF5A5A), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                PostThumbnail(
+                                    urls = media.thumbnailUrls,
+                                    ext = media.ext,
+                                    isSpoiler = media.isSpoiler,
+                                    labelSize = 10.sp,
+                                    background = Color(0xFF2A2A2A),
+                                    modifier = Modifier.size(72.dp),
+                                    onClick = {
+                                        mediaOpenedFromGallery = true
+                                        selectedMediaIndex = mediaIndex
+                                        showGalleryList = false
                                     }
-                                }
+                                )
 
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text("No. ${media.postNo}", color = Color.White, fontWeight = FontWeight.Bold)
@@ -1713,9 +1695,8 @@ fun ThreadScreen(
                     if (currentMedia.kind == MediaKind.Video) {
                         WebmPlayer(url = currentMedia.url, modifier = Modifier.fillMaxSize())
                     } else {
-                        AsyncImage(
-                            model = currentMedia.url,
-                            contentDescription = null,
+                        var fullImageLoaded by remember(currentMedia.url) { mutableStateOf(false) }
+                        Box(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .clipToBounds()
@@ -1724,9 +1705,35 @@ fun ThreadScreen(
                                     scaleY = scale,
                                     translationX = offsetX,
                                     translationY = offsetY
-                                ),
-                            contentScale = ContentScale.Fit
-                        )
+                                )
+                        ) {
+                            // The (already cached) thumbnail stands in until the full image arrives.
+                            val placeholder = currentMedia.thumbnailUrls.firstOrNull()
+                            if (!fullImageLoaded && placeholder != null) {
+                                AsyncImage(
+                                    model = placeholder,
+                                    contentDescription = null,
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = ContentScale.Fit
+                                )
+                            }
+                            AsyncImage(
+                                model = currentMedia.url,
+                                contentDescription = null,
+                                onSuccess = { fullImageLoaded = true },
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Fit
+                            )
+                        }
+                        if (!fullImageLoaded) {
+                            CircularProgressIndicator(
+                                color = LoadingGreen,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .size(28.dp)
+                            )
+                        }
                     }
                 }
 
@@ -1812,273 +1819,12 @@ fun ThreadScreen(
             board = board,
             threadNo = threadNo,
             replyToNo = replyNo.takeIf { it > 0L },
-            onClose = { replyComposerTargetNo = null }
+            onClose = { replyComposerTargetNo = null },
+            onPosted = {
+                replyComposerTargetNo = null
+                scrollToLatestAfterLoad = true
+                vm.load(forceRefresh = true)
+            }
         )
     }
 }
-
-@Composable
-fun NewThreadComposerScreen(
-    board: String,
-    onBack: () -> Unit
-) {
-    ReplyComposerOverlay(
-        board = board,
-        threadNo = null,
-        replyToNo = null,
-        onClose = onBack
-    )
-}
-
-@Composable
-private fun ReplyComposerOverlay(
-    board: String,
-    threadNo: Long?,
-    replyToNo: Long?,
-    onClose: () -> Unit
-) {
-    val context = LocalContext.current
-    val pageUrl = remember(board, threadNo) {
-        if (threadNo != null && threadNo > 0L) {
-            "https://holotower.org/$board/res/$threadNo.html"
-        } else {
-            "https://holotower.org/$board/index.html"
-        }
-    }
-    val webView = remember {
-        WebView(context).apply {
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            setBackgroundColor(android.graphics.Color.BLACK)
-            alpha = 0f
-        }
-    }
-    var isComposerReady by remember(pageUrl, replyToNo) { mutableStateOf(false) }
-    var pendingFileCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
-    val filePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        val callback = pendingFileCallback
-        pendingFileCallback = null
-        callback?.onReceiveValue(
-            WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
-        )
-    }
-
-    BackHandler(onBack = onClose)
-
-    DisposableEffect(pageUrl, replyToNo) {
-        webView.webChromeClient = object : WebChromeClient() {
-            override fun onShowFileChooser(
-                view: WebView?,
-                filePathCallback: ValueCallback<Array<Uri>>?,
-                fileChooserParams: FileChooserParams?
-            ): Boolean {
-                pendingFileCallback?.onReceiveValue(null)
-                pendingFileCallback = filePathCallback
-                val intent = runCatching { fileChooserParams?.createIntent() }.getOrNull()
-                if (intent == null) {
-                    pendingFileCallback?.onReceiveValue(null)
-                    pendingFileCallback = null
-                    return false
-                }
-                filePickerLauncher.launch(intent)
-                return true
-            }
-        }
-
-        webView.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val raw = request?.url?.toString().orEmpty()
-                val normalized = raw.lowercase()
-                val boardRoot = "https://holotower.org/$board/"
-                val boardIndex = "https://holotower.org/$board/index.html"
-                val boardCatalog = "https://holotower.org/$board/catalog.html"
-                if (normalized == boardRoot || normalized.startsWith(boardIndex) || normalized.startsWith(boardCatalog)) {
-                    view?.loadUrl(pageUrl)
-                    return true
-                }
-                return false
-            }
-
-            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                super.onPageStarted(view, url, favicon)
-                isComposerReady = false
-                view?.alpha = 0f
-            }
-
-            override fun onPageFinished(view: WebView, url: String?) {
-                super.onPageFinished(view, url)
-                val quoteScript = if (replyToNo != null) {
-                    """
-                      var quote = ">>$replyToNo\n";
-                      if (!ta.value || ta.value.indexOf(quote.trim()) !== 0) {
-                        ta.value = quote + ta.value;
-                      }
-                    """.trimIndent()
-                } else {
-                    ""
-                }
-                val script = """
-                    (function() {
-                      document.querySelectorAll("link[rel='stylesheet'], style").forEach(function(el) {
-                        el.remove();
-                      });
-
-                      var form = document.querySelector("form[name='post']");
-                      if (!form) return "no-form";
-
-                      document.body.innerHTML = "";
-                      document.body.appendChild(form);
-                      document.documentElement.style.background = "#0A0A0A";
-                      document.body.style.background = "#0A0A0A";
-                      document.body.style.color = "#EAEAEA";
-                      document.body.style.margin = "0";
-                      document.body.style.padding = "10px";
-                      document.body.style.fontFamily = "sans-serif";
-
-                      var style = document.createElement("style");
-                      style.textContent = `
-                        * { box-sizing: border-box !important; }
-                        form[name="post"] { max-width: 900px !important; margin: 0 auto !important; }
-                        form[name="post"] table { width: 100% !important; border-collapse: collapse !important; }
-                        form[name="post"] tr { display: block !important; margin: 0 0 10px 0 !important; background: transparent !important; }
-                        form[name="post"] th, form[name="post"] td {
-                          display: block !important;
-                          width: 100% !important;
-                          margin: 0 !important;
-                          padding: 0 !important;
-                          border: none !important;
-                          background: transparent !important;
-                        }
-                        form[name="post"] th {
-                          color: #9CA3AF !important;
-                          font-size: 12px !important;
-                          font-weight: 600 !important;
-                          margin-bottom: 6px !important;
-                          text-align: left !important;
-                        }
-                        form[name="post"] input[type="text"],
-                        form[name="post"] input[type="password"],
-                        form[name="post"] input[type="file"],
-                        form[name="post"] textarea {
-                          width: 100% !important;
-                          background: #16181B !important;
-                          color: #EAEAEA !important;
-                          border: 1px solid #2A2F35 !important;
-                          border-radius: 10px !important;
-                          padding: 10px 12px !important;
-                          outline: none !important;
-                          font-size: 14px !important;
-                        }
-                        form[name="post"] textarea { min-height: 220px !important; line-height: 1.4 !important; }
-                        form[name="post"] input[type="submit"] {
-                          background: #00FF9F !important;
-                          color: #03281A !important;
-                          border: none !important;
-                          border-radius: 999px !important;
-                          padding: 9px 16px !important;
-                          font-weight: 700 !important;
-                          margin-top: 8px !important;
-                          cursor: pointer !important;
-                        }
-                        form[name="post"] .unimportant { color: #7B8088 !important; font-size: 11px !important; }
-                        #upload_settings label, #upload_settings { color: #C8CDD4 !important; }
-                      `;
-                      document.head.appendChild(style);
-
-                      var ta = form
-                        ? form.querySelector("textarea[name='body'], textarea[name='com'], textarea#body, textarea#com, textarea")
-                        : document.querySelector("textarea[name='body'], textarea[name='com'], textarea#body, textarea#com, textarea");
-                      if (!ta) return;
-                      $quoteScript
-                      ta.focus();
-                      if (ta.setSelectionRange) {
-                        var len = ta.value.length;
-                        ta.setSelectionRange(len, len);
-                      }
-                      return "ok";
-                    })();
-                """.trimIndent()
-                view.evaluateJavascript(script) {
-                    isComposerReady = true
-                    view.alpha = 1f
-                }
-            }
-        }
-
-        webView.loadUrl(pageUrl)
-        onDispose {
-            pendingFileCallback?.onReceiveValue(null)
-            pendingFileCallback = null
-            webView.stopLoading()
-            webView.webChromeClient = WebChromeClient()
-            webView.webViewClient = WebViewClient()
-        }
-    }
-
-    HorizontalSwipeLayer(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xEE000000)),
-        enabled = true,
-        threshold = COMPOSER_CLOSE_THRESHOLD,
-        allowPositive = true,
-        allowNegative = false,
-        positiveCueLabel = null,
-        negativeCueLabel = null,
-        cueStartFraction = 0.88f,
-        onCommit = { onClose() }
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .statusBarsPadding()
-                .navigationBarsPadding()
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF111111))
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                val title = when {
-                    threadNo == null || threadNo <= 0L -> "New Thread"
-                    replyToNo != null -> "Reply >>$replyToNo"
-                    else -> "Reply"
-                }
-                Text(
-                    text = title,
-                    color = Color.White,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Spacer(modifier = Modifier.weight(1f))
-                BottomOverlayButton(text = "Close", onClick = onClose)
-            }
-
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-            ) {
-                AndroidView(
-                    modifier = Modifier.fillMaxSize(),
-                    factory = { webView },
-                    update = { }
-                )
-                if (!isComposerReady) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(Color(0xFF0A0A0A)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        CircularProgressIndicator(color = LoadingGreen)
-                    }
-                }
-            }
-        }
-    }
-}
-

@@ -1,11 +1,9 @@
 package com.holotower.app.ui.common
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -16,19 +14,14 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import coil3.compose.AsyncImage
 import com.holotower.app.data.model.Post
 
 @Composable
@@ -100,56 +93,20 @@ fun PostCard(
             Spacer(modifier = Modifier.height(8.dp))
 
             Row(modifier = Modifier.fillMaxWidth()) {
-                val thumbUrls = remember(post.tim, post.ext, board) { post.thumbnailUrls(board) }
-                var thumbIndex by remember(post.no, board) { mutableStateOf(0) }
-                var thumbExhausted by remember(post.no, board) { mutableStateOf(false) }
-                val thumbUrl = thumbUrls.getOrNull(thumbIndex)
+                val thumbUrls = remember(post.tim, post.ext, post.spoiler, board) { post.thumbnailUrls(board) }
                 val fullImageUrl = remember(post.tim, post.ext, board) { post.fullImageUrl(board) }
                 val suggestedName = remember(post.filename, post.tim, post.ext) { suggestImageFileName(post) }
 
-                if (thumbUrl != null && !thumbExhausted) {
-                    AsyncImage(
-                        model = thumbUrl,
-                        contentDescription = null,
-                        onError = {
-                            if (thumbIndex < thumbUrls.lastIndex) {
-                                thumbIndex += 1
-                            } else {
-                                thumbExhausted = true
-                            }
-                        },
-                        alignment = Alignment.TopCenter,
+                if (fullImageUrl != null) {
+                    PostThumbnail(
+                        urls = thumbUrls,
+                        ext = post.ext,
+                        isSpoiler = post.isSpoiler,
                         modifier = Modifier
                             .size(100.dp)
-                            .background(Color(0xFF333333), RoundedCornerShape(4.dp))
-                            .let {
-                                if (fullImageUrl != null) {
-                                    it.clickable { onImageClick(post.no, fullImageUrl, suggestedName) }
-                                } else {
-                                    it
-                                }
-                            },
-                        contentScale = ContentScale.Crop
+                            .clip(RoundedCornerShape(4.dp)),
+                        onClick = { onImageClick(post.no, fullImageUrl, suggestedName) }
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
-                } else if (fullImageUrl != null) {
-                    Box(
-                        modifier = Modifier
-                            .size(100.dp)
-                            .background(Color(0xFF272727), RoundedCornerShape(4.dp))
-                            .let {
-                                it.clickable { onImageClick(post.no, fullImageUrl, suggestedName) }
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "SPOILER",
-                            color = Color(0xFFFF5A5A),
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 11.sp,
-                            textAlign = TextAlign.Center
-                        )
-                    }
                     Spacer(modifier = Modifier.width(8.dp))
                 }
 

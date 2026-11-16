@@ -210,8 +210,8 @@ fun CatalogScreen(
     }
 
     LaunchedEffect(board, isCurrentDestination) {
-        // Reuses a recent catalog after returning from a thread; the view model refreshes
-        // on its own after a short TTL, and pull-to-refresh always forces a fetch.
+        // Every return to the catalog: Wi-Fi downloads; mobile data reuses a list under
+        // 10 minutes old (see CatalogViewModel.load). Pull-to-refresh always downloads.
         if (isCurrentDestination) vm.load(boardName = board)
     }
 
@@ -221,7 +221,7 @@ fun CatalogScreen(
     LaunchedEffect(returnToken, isCurrentDestination) {
         if (isCurrentDestination && returnToken != handledReturnToken) {
             handledReturnToken = returnToken
-            vm.load(boardName = board, forceRefresh = true)
+            vm.load(boardName = board)
         }
     }
 

@@ -1,6 +1,7 @@
 package com.holotower.app.viewmodel
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.holotower.app.data.model.CatalogThread
 import com.holotower.app.data.network.userMessage
@@ -21,9 +22,9 @@ sealed class CatalogUiState {
     data class Error(val message: String, override val threads: List<CatalogThread>? = null) : CatalogUiState()
 }
 
-class CatalogViewModel(
-    private val repo: BoardRepository = BoardRepository()
-) : ViewModel() {
+/** Created by the default factory, which passes the Application (needed for the network check). */
+class CatalogViewModel(application: Application) : AndroidViewModel(application) {
+    private val repo = BoardRepository(application)
 
     private var board: String = "hlgg"
     private var loadJob: Job? = null
@@ -34,10 +35,21 @@ class CatalogViewModel(
     private val _state = MutableStateFlow<CatalogUiState>(CatalogUiState.Loading())
     val state: StateFlow<CatalogUiState> = _state
 
+    /**
+     * Downloads the catalog, except on mobile data when the list on screen is under
+     * [MOBILE_REUSE_MS] old. On Wi-Fi every call downloads. [forceRefresh] always does.
+     */
     fun load(boardName: String = board, forceRefresh: Boolean = false) {
         if (!forceRefresh && lastSuccessfulBoard == boardName &&
             _state.value is CatalogUiState.Success &&
-            System.currentTimeMillis() - lastSuccessfulLoadAtMs < AUTO_REFRESH_INTERVAL_MS
+            repo.isOnMeteredNetwork() &&
+            System.currentTimeMillis() - lastSuccessfulLoadAtMs in 0 until MOBILE_REUSE_MS
+        ) {
+            return
+        }
+        // Don't let a load already running restart for nothing (e.g. quick back-and-forth).
+        if (!forceRefresh && _state.value is CatalogUiState.Loading && loadJob?.isActive == true &&
+            board == boardName
         ) {
             return
         }
@@ -48,7 +60,8 @@ class CatalogViewModel(
         loadJob = viewModelScope.launch {
             _state.value = CatalogUiState.Loading(previous)
             try {
-                val fresh = repo.getCatalogThreads(board, forceRefresh = forceRefresh)
+                // The decision to download was made above; skip the repository's own short cache.
+                val fresh = repo.getCatalogThreads(board, forceRefresh = true)
                 lastSuccessfulBoard = board
                 lastSuccessfulLoadAtMs = System.currentTimeMillis()
                 _state.value = CatalogUiState.Success(applyThreadCountOverrides(board, fresh))
@@ -99,7 +112,8 @@ class CatalogViewModel(
         }
 
     private companion object {
-        const val AUTO_REFRESH_INTERVAL_MS = 2 * 60 * 1000L
+        /** On mobile data, a catalog downloaded less than this long ago is reused. */
+        const val MOBILE_REUSE_MS = 10 * 60 * 1000L
         const val MAX_THREAD_COUNT_OVERRIDES = 128
     }
 }

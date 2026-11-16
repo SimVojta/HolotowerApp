@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.google.gson.Gson
+import com.google.gson.annotations.SerializedName
 import com.holotower.app.data.network.ChallengeGate
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -59,7 +60,10 @@ private val gson = Gson()
 private val Accent = Color(0xFF00FF9F)
 
 /** What the page currently shows, read with JavaScript. */
-private data class PageProbe(val challenge: Boolean = true, val text: String = "")
+private data class PageProbe(
+    @SerializedName("challenge") val challenge: Boolean = true,
+    @SerializedName("text") val text: String = ""
+)
 
 private const val PROBE_SCRIPT = """
 (function() {

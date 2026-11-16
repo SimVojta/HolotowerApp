@@ -12,6 +12,14 @@
 #   public *;
 #}
 
+# Called from JavaScript by name ("AndroidBridge.onResult"); R8 cannot see that.
+-keepclassmembers class com.holotower.app.data.network.WebViewBridge {
+    @android.webkit.JavascriptInterface <methods>;
+}
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}
+
 # Uncomment this to preserve the line number information for
 # debugging stack traces.
 #-keepattributes SourceFile,LineNumberTable

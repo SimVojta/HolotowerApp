@@ -110,6 +110,7 @@ import com.holotower.app.data.repository.BoardRepository
 import com.holotower.app.ui.common.PostCard
 import com.holotower.app.ui.common.PostThumbnail
 import com.holotower.app.ui.common.prewarmPostHtml
+import com.holotower.app.ui.common.unsafeFileNameChars
 import com.holotower.app.viewmodel.ThreadUiState
 import com.holotower.app.viewmodel.ThreadViewModel
 import kotlinx.coroutines.FlowPreview
@@ -456,7 +457,7 @@ private val replyMarkupRegex = Regex("(?:&gt;|>){2}(\\d+)", RegexOption.IGNORE_C
 
 private fun suggestMediaFileName(post: Post): String {
     val base = (post.filename?.trim().takeUnless { it.isNullOrBlank() } ?: post.tim ?: "media")
-        .replace(Regex("[^A-Za-z0-9._-]"), "_")
+        .replace(unsafeFileNameChars, "_")
     val ext = post.ext?.takeIf { it.startsWith(".") } ?: ".jpg"
     return "$base$ext"
 }
@@ -989,8 +990,11 @@ fun ThreadScreen(
     }
 
     var showJumpToLatestChip by remember(threadNo) { mutableStateOf(false) }
-    var jumpToLatestChipToken by remember(threadNo) { mutableIntStateOf(0) }
 
+    // Shows the chip while scrolling far from the end and hides it 5 s after the last
+    // movement. Only showJumpToLatestChip is state the screen reads, and it changes just
+    // twice per scroll. (A counter bumped for every post scrolled past used to make the
+    // whole thread screen recompose on every post, which caused much of the scroll jank.)
     LaunchedEffect(threadNo, anyOverlayOpen) {
         snapshotFlow {
             Triple(listState.isScrollInProgress, distanceFromLatest, isAtBottom)
@@ -999,17 +1003,12 @@ fun ThreadScreen(
                 showJumpToLatestChip = false
                 return@collectLatest
             }
-            if (isScrolling) {
-                jumpToLatestChipToken += 1
-                showJumpToLatestChip = true
+            if (isScrolling) showJumpToLatestChip = true
+            if (showJumpToLatestChip) {
+                delay(JUMP_TO_LATEST_VISIBLE_MS) // restarted by every new emission
+                showJumpToLatestChip = false
             }
         }
-    }
-
-    LaunchedEffect(jumpToLatestChipToken) {
-        if (jumpToLatestChipToken == 0) return@LaunchedEffect
-        delay(JUMP_TO_LATEST_VISIBLE_MS)
-        showJumpToLatestChip = false
     }
 
     Scaffold(

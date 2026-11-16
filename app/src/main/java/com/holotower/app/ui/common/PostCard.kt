@@ -10,8 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
+import androidx.compose.foundation.background
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
@@ -23,6 +22,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.holotower.app.data.model.Post
+
+private val PostCardColor = Color(0xFF1E1E1E)
+private val PostCardShape = RoundedCornerShape(4.dp)
 
 @Composable
 fun PostCard(
@@ -36,12 +38,13 @@ fun PostCard(
     onExternalLinkClick: (url: String) -> Unit = {},
     onPostNumberClick: (Long) -> Unit = {}
 ) {
-    Card(
+    // A plain rounded background looks the same as a Material Card here (flat, no
+    // elevation) and is cheaper to build for every post that scrolls into view.
+    Column(
         modifier = modifier
             .fillMaxWidth()
-            .padding(vertical = 4.dp, horizontal = 8.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
-        shape = RoundedCornerShape(4.dp)
+            .padding(vertical = 4.dp, horizontal = 8.dp)
+            .background(PostCardColor, PostCardShape)
     ) {
         Column(modifier = Modifier.padding(8.dp)) {
             val formattedTime = remember(post.time) { post.formattedTime() }
@@ -123,10 +126,13 @@ fun PostCard(
     }
 }
 
+/** Compiled once; compiling it per post showed up in the scroll profile. */
+internal val unsafeFileNameChars = Regex("[^A-Za-z0-9._-]")
+
 private fun suggestImageFileName(post: Post): String {
     val base = (post.filename?.trim().takeUnless { it.isNullOrBlank() }
         ?: post.tim
-        ?: "image").replace(Regex("[^A-Za-z0-9._-]"), "_")
+        ?: "image").replace(unsafeFileNameChars, "_")
 
     val ext = post.ext?.takeIf { it.startsWith(".") } ?: ".jpg"
     return "$base$ext"

@@ -178,7 +178,7 @@ fun ChallengeOverlay(request: ChallengeGate.Request) {
             Column(modifier = Modifier.weight(1f)) {
                 Text("Security check", color = Color.White, fontWeight = FontWeight.SemiBold)
                 Text(
-                    "Cloudflare is checking this device. It usually finishes by itself.",
+                    "Usually it's automatic. Sometimes you need to tap the checkbox below.",
                     color = Color(0xFFAAB2BA),
                     fontSize = 12.sp
                 )

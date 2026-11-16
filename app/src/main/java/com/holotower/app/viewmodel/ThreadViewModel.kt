@@ -36,21 +36,40 @@ class ThreadViewModel(
         load()
     }
 
-    /** Shows the saved copy at once (if any), then always downloads the current thread. */
+    /** When the posts on screen were downloaded (from the saved copy's timestamp, or a fetch). */
+    private var shownDownloadedAtMs = 0L
+
+    /**
+     * Shows the saved copy at once (if any), then downloads the current thread, except on
+     * mobile data when what's shown is under [SAVED_COPY_FRESH_MS] old. [forceRefresh]
+     * (pull-to-refresh, the refresh button, retry, after posting) always downloads.
+     */
     fun load(forceRefresh: Boolean = false) {
         loadJob?.cancel()
         loadJob = viewModelScope.launch {
             var shown = _state.value.posts
             if (shown == null && !forceRefresh) {
-                shown = repo.cachedThreadPosts(board, threadNo)
+                repo.savedThread(board, threadNo)?.let { saved ->
+                    shown = saved.posts
+                    shownDownloadedAtMs = saved.savedAtMs
+                }
             }
-            _state.value = ThreadUiState.Loading(shown)
+            val current = shown
+            if (!forceRefresh && current != null && repo.isOnMeteredNetwork() &&
+                System.currentTimeMillis() - shownDownloadedAtMs in 0 until SAVED_COPY_FRESH_MS
+            ) {
+                _state.value = ThreadUiState.Success(current)
+                return@launch
+            }
+            _state.value = ThreadUiState.Loading(current)
             try {
-                _state.value = ThreadUiState.Success(repo.fetchThreadPosts(board, threadNo))
+                val fresh = repo.fetchThreadPosts(board, threadNo)
+                shownDownloadedAtMs = System.currentTimeMillis()
+                _state.value = ThreadUiState.Success(fresh)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                _state.value = ThreadUiState.Error(e.userMessage("Failed to load thread"), shown)
+                _state.value = ThreadUiState.Error(e.userMessage("Failed to load thread"), current)
             }
         }
     }
@@ -66,6 +85,11 @@ class ThreadViewModel(
         if (!releasedForMemory) return
         releasedForMemory = false
         load()
+    }
+
+    private companion object {
+        /** On mobile data, a thread downloaded less than this long ago is not downloaded again. */
+        const val SAVED_COPY_FRESH_MS = 10 * 60 * 1000L
     }
 
     class Factory(

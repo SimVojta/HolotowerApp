@@ -863,7 +863,8 @@ fun ThreadScreen(
     LaunchedEffect(returnToken, isCurrentDestination, anyOverlayOpen) {
         if (isCurrentDestination && !anyOverlayOpen && returnToken != handledReturnToken) {
             handledReturnToken = returnToken
-            vm.load(forceRefresh = true)
+            // Not forced: on mobile data a thread downloaded <10 min ago is kept.
+            vm.load()
         }
     }
 

@@ -17,7 +17,12 @@ import java.nio.file.StandardCopyOption
 class ThreadDiskCache(context: Context) {
     private val directory = File(context.applicationContext.noBackupFilesDir, CACHE_DIRECTORY)
 
-    suspend fun read(board: String, threadNo: Long): String? = withContext(Dispatchers.IO) {
+    data class Entry(val json: String, val savedAtMs: Long)
+
+    suspend fun read(board: String, threadNo: Long): String? = readEntry(board, threadNo)?.json
+
+    /** The saved JSON and when it was downloaded. */
+    suspend fun readEntry(board: String, threadNo: Long): Entry? = withContext(Dispatchers.IO) {
         synchronized(cacheLock) {
             val now = System.currentTimeMillis()
             prune(now)
@@ -33,7 +38,7 @@ class ThreadDiskCache(context: Context) {
                     } else {
                         val json = GZIPInputStream(input).bufferedReader(Charsets.UTF_8).use { it.readText() }
                         file.setLastModified(now)
-                        json
+                        Entry(json, savedAt)
                     }
                 }
             } catch (_: Exception) {

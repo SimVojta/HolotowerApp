@@ -1,6 +1,7 @@
 package com.holotower.app.data.repository
 
 import android.content.Context
+import android.net.ConnectivityManager
 import android.text.Html
 import com.google.gson.Gson
 import com.holotower.app.data.model.CatalogThread
@@ -14,6 +15,7 @@ import kotlinx.coroutines.withContext
 import java.net.URLEncoder
 
 class BoardRepository(context: Context? = null) {
+    private val appContext = context?.applicationContext
     private val threadDiskCache = context?.let(::ThreadDiskCache)
 
     suspend fun getCatalogThreads(board: String, forceRefresh: Boolean = false): List<CatalogThread> {
@@ -30,15 +32,28 @@ class BoardRepository(context: Context? = null) {
         return fresh
     }
 
-    /** The saved copy of a thread (up to 5 days old), or null. Never touches the network. */
-    suspend fun cachedThreadPosts(board: String, threadNo: Long): List<Post>? {
+    data class SavedThread(val posts: List<Post>, val savedAtMs: Long)
+
+    /** The saved copy of a thread (up to 5 days old) and when it was downloaded. Never touches the network. */
+    suspend fun savedThread(board: String, threadNo: Long): SavedThread? {
         val cache = threadDiskCache ?: return null
-        val cachedJson = cache.read(board, threadNo) ?: return null
-        return runCatching { parseThread(cachedJson) }.getOrNull()
+        val entry = cache.readEntry(board, threadNo) ?: return null
+        val posts = runCatching { parseThread(entry.json) }.getOrNull()
             ?: run {
                 cache.remove(board, threadNo)
-                null
+                return null
             }
+        return SavedThread(posts, entry.savedAtMs)
+    }
+
+    suspend fun cachedThreadPosts(board: String, threadNo: Long): List<Post>? =
+        savedThread(board, threadNo)?.posts
+
+    /** True on mobile data (or a metered hotspot); false on ordinary Wi-Fi. */
+    fun isOnMeteredNetwork(): Boolean {
+        val cm = appContext?.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return false
+        return cm.isActiveNetworkMetered
     }
 
     /** Downloads the thread and updates the saved copy. */

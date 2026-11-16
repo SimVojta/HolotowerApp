@@ -67,7 +67,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -110,6 +109,7 @@ import com.holotower.app.data.network.RetrofitClient
 import com.holotower.app.data.repository.BoardRepository
 import com.holotower.app.ui.common.PostCard
 import com.holotower.app.ui.common.PostThumbnail
+import com.holotower.app.ui.common.prewarmPostHtml
 import com.holotower.app.viewmodel.ThreadUiState
 import com.holotower.app.viewmodel.ThreadViewModel
 import kotlinx.coroutines.FlowPreview
@@ -914,13 +914,21 @@ fun ThreadScreen(
         }
     }
 
+    // Parse every post's text in the background as soon as the thread is known, so
+    // posts scrolled back into view already have their final height.
+    LaunchedEffect(allPosts) {
+        if (allPosts.isEmpty()) return@LaunchedEffect
+        withContext(Dispatchers.Default) { prewarmPostHtml(allPosts.map { it.com.orEmpty() }) }
+    }
+
+    // Keeps the previous backlinks until the new ones are ready; resetting to empty on
+    // every refresh made each post lose its "replies" line for a frame and jump.
+    var backlinksByPostNo by remember(threadNo) { mutableStateOf<Map<Long, List<Long>>>(emptyMap()) }
+    LaunchedEffect(allPosts) {
+        backlinksByPostNo = withContext(Dispatchers.Default) { buildBacklinks(allPosts) }
+    }
+
     val renderPostList: @Composable (List<Post>) -> Unit = { posts ->
-        val backlinksByPostNo by produceState<Map<Long, List<Long>>>(
-            initialValue = emptyMap(),
-            key1 = posts
-        ) {
-            value = withContext(Dispatchers.Default) { buildBacklinks(posts) }
-        }
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             state = listState,

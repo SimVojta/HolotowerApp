@@ -13,7 +13,6 @@ import androidx.compose.material3.LocalTextStyle
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.text.font.FontWeight
@@ -27,8 +26,6 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.unit.TextUnit
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import java.util.LinkedHashMap
 
 private const val REPLY_TAG = "reply_target"
@@ -51,8 +48,9 @@ private data class HtmlCacheKey(
 private data class HtmlCacheEntry(val text: AnnotatedString, val weight: Int)
 
 private object ParsedHtmlCache {
-    private const val MAX_ENTRIES = 128
-    private const val MAX_WEIGHT = 350_000
+    // Big enough for a whole long thread (a 1,500-post thread is roughly 1.5M weight).
+    private const val MAX_ENTRIES = 5_000
+    private const val MAX_WEIGHT = 3_000_000
     private val entries = LinkedHashMap<HtmlCacheKey, HtmlCacheEntry>(16, 0.75f, true)
     private var currentWeight = 0
 
@@ -80,30 +78,18 @@ fun HtmlText(
     modifier: Modifier = Modifier,
     fontSize: TextUnit = TextUnit.Unspecified,
     textColor: Color = Color(0xFFECECEC),
-    quoteColor: Color = Color(0xFF789922),
-    replyColor: Color = Color(0xFFDD4444),
-    linkColor: Color = Color(0xFF6CB6FF),
+    quoteColor: Color = DefaultQuoteColor,
+    replyColor: Color = DefaultReplyColor,
+    linkColor: Color = DefaultLinkColor,
     onReplyClick: ((postNo: Long, threadNoHint: Long?) -> Unit)? = null,
     onLinkClick: ((url: String) -> Unit)? = null
 ) {
-    // A post that has already been visited should render its text on the first
-    // frame when LazyColumn composes it again. Showing an empty string until the
-    // background parser finishes changes the row height and can move the scroll
-    // anchor while the reader is moving quickly through the thread.
-    val cachedAnnotated = remember(html, quoteColor, replyColor, linkColor) {
-        getCachedHtmlAnnotatedString(html, quoteColor, replyColor, linkColor)
-    }
-    val annotated by produceState(
-        initialValue = cachedAnnotated ?: AnnotatedString(""),
-        key1 = html,
-        key2 = quoteColor,
-        key3 = replyColor to linkColor
-    ) {
-        if (cachedAnnotated == null) {
-            value = withContext(Dispatchers.Default) {
-                rememberHtmlAnnotatedString(html, quoteColor, replyColor, linkColor)
-            }
-        }
+    // The text must be there on the first frame. A post drawn empty and filled in a
+    // frame later changes height, which makes the list jump while scrolling (most
+    // visibly when scrolling up). Threads are parsed ahead with prewarmPostHtml(), so
+    // this normally hits the cache; parsing one post here is the rare fallback.
+    val annotated = remember(html, quoteColor, replyColor, linkColor) {
+        rememberHtmlAnnotatedString(html, quoteColor, replyColor, linkColor)
     }
 
     // Spoilers stay covered until tapped; each one is keyed by its start offset.
@@ -297,12 +283,19 @@ fun rememberHtmlAnnotatedString(
     return builder.toAnnotatedString().also { ParsedHtmlCache.put(cacheKey, it) }
 }
 
-private fun getCachedHtmlAnnotatedString(
-    html: String,
-    quoteColor: Color,
-    replyColor: Color,
-    linkColor: Color
-): AnnotatedString? = ParsedHtmlCache.get(HtmlCacheKey(html, quoteColor, replyColor, linkColor))
+/**
+ * Parses post bodies into the cache ahead of time, with the colours PostCard uses for
+ * the body, so scrolling never waits on parsing. Call off the main thread.
+ */
+fun prewarmPostHtml(bodies: List<String>) {
+    bodies.forEach { html ->
+        rememberHtmlAnnotatedString(html, DefaultQuoteColor, DefaultReplyColor, DefaultLinkColor)
+    }
+}
+
+private val DefaultQuoteColor = Color(0xFF789922)
+private val DefaultReplyColor = Color(0xFFDD4444)
+private val DefaultLinkColor = Color(0xFF6CB6FF)
 
 private fun buildThreadHintQueues(html: String): MutableMap<Long, ArrayDeque<Long?>> {
     val result = mutableMapOf<Long, ArrayDeque<Long?>>()

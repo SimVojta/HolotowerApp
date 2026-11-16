@@ -1,8 +1,15 @@
 package com.holotower.app.data.model
 
 import com.google.gson.annotations.SerializedName
-import java.text.SimpleDateFormat
-import java.util.*
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+
+/** One shared, thread-safe formatter instead of a new SimpleDateFormat per post. */
+private val postTimeFormatter: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("MM/dd/yy(EEE)HH:mm:ss", Locale.getDefault())
+        .withZone(ZoneId.systemDefault())
 
 data class ThreadResponse(
     @SerializedName("posts") val posts: List<Post>
@@ -56,8 +63,5 @@ data class Post(
         }
     }
 
-    fun formattedTime(): String {
-        val sdf = SimpleDateFormat("MM/dd/yy(EEE)HH:mm:ss", Locale.getDefault())
-        return sdf.format(Date(time * 1000L))
-    }
+    fun formattedTime(): String = postTimeFormatter.format(Instant.ofEpochSecond(time))
 }

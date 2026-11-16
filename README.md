@@ -2,6 +2,14 @@
 
 Unofficial Android client for browsing Holotower.
 
+## Download
+[**HoloTower-v0.2.0.apk**](apk/HoloTower-v0.2.0.apk) (Android 8.0+)
+
+Install it by opening the file on your phone and allowing installs from that source
+when Android asks. If you have a copy installed that was signed differently (for
+example from another source), Android will refuse to update it: uninstall that copy
+first.
+
 ## Features
 - Catalog view with search, sort, and filters
 - Thread view with:
